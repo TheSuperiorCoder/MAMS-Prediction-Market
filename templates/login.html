@@ -3,12 +3,69 @@
 {% block content %}
 <div class="auth card">
   <h1>Log in</h1>
-  <form method="post" class="stack">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <label class="field"><span>Username</span><input name="username" required autofocus autocomplete="username"></label>
-    <label class="field"><span>Password</span><input type="password" name="password" required autocomplete="current-password"></label>
-    <button class="btn btn-block">Log in</button>
-  </form>
-  <p class="muted center">New here? <a href="{{ url_for('register') }}">Create an account</a></p>
+  {% if stage == "select" %}
+    <form method="post" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="stage" value="select">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <label class="field"><span>Your name</span>
+        <select name="username" required autofocus>
+          <option value="">Select your name</option>
+          {% for name in names %}<option value="{{ name }}">{{ name }}</option>{% endfor %}
+        </select>
+      </label>
+      <button class="btn btn-block" {% if not names %}disabled{% endif %}>Continue</button>
+    </form>
+  {% elif stage == "password" %}
+    <p class="muted">Welcome back, <strong>{{ selected_name }}</strong>. Enter your password.</p>
+    <form method="post" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="stage" value="password">
+      <input type="hidden" name="username" value="{{ selected_name }}">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <label class="field"><span>Password</span>
+        <input type="password" name="password" required autofocus autocomplete="current-password">
+      </label>
+      <button class="btn btn-block">Log in</button>
+    </form>
+    <form method="post" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="stage" value="back_to_select">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <button class="btn btn-small btn-ghost" type="submit">Back to name selection</button>
+    </form>
+  {% elif stage == "verify" %}
+    <p class="muted">We sent a verification code to the email address on file for <strong>{{ selected_name }}</strong>.</p>
+    <form method="post" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="stage" value="verify">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <label class="field"><span>Verification code</span>
+        <input name="code" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" required autofocus autocomplete="one-time-code">
+      </label>
+      <button class="btn btn-small btn-ghost" type="submit" name="action" value="resend" formnovalidate>Resend code</button>
+      <button class="btn btn-block">Verify code</button>
+    </form>
+    <form method="post" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="stage" value="back_to_select">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <button class="btn btn-small btn-ghost" type="submit">Back to name selection</button>
+    </form>
+  {% elif stage == "create_password" %}
+    <p class="muted">Email verified for <strong>{{ selected_name }}</strong>. Create your password.</p>
+    <form method="post" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="stage" value="create_password">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <label class="field"><span>Password</span>
+        <input type="password" name="password" required minlength="8" autofocus autocomplete="new-password">
+      </label>
+      <label class="field"><span>Confirm password</span>
+        <input type="password" name="confirm" required minlength="8" autocomplete="new-password">
+      </label>
+      <button class="btn btn-block">Create password</button>
+    </form>
+  {% endif %}
 </div>
 {% endblock %}

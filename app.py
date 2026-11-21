@@ -1,17 +1,22 @@
 """MAMS Prediction Market — bet virtual MAMS Bucks on Mass Academy events."""
 
+import hashlib
+import hmac
 import json
 import math
 import os
 import re
 import secrets
 import sqlite3
+import smtplib
+import ssl
 import time
 from datetime import date, datetime, timedelta
+from email.message import EmailMessage
 from functools import wraps
 
 from flask import (Flask, abort, flash, g, jsonify, redirect, render_template,
-                   request, session, url_for)
+                   request, session, url_for, current_app)
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -50,14 +55,17 @@ DISPUTE_HOURS = int(DISPUTE_WINDOW.total_seconds() // 3600)
 # Making a market costs CREATION_FEE (refunded if you withdraw your proposal, kept if it's rejected), and everyone
 # else pays the market's creator ENTRY_FEE on their first bet in it. Good markets that attract traders earn their
 # creator money; flooding the site with junk proposals costs money.
-CREATION_FEE = 10.0
-ENTRY_FEE = 10.0
+CREATION_FEE = 0.0
+ENTRY_FEE = 0.0
 # Whoever makes a market must also bet at least this much on it, so they have skin in the game.
-CREATOR_MIN_BET = 10.0
+CREATOR_MIN_BET = 0.0
 CATEGORIES = ["Academics", "Competitions", "Sports", "Events", "Campus Life", "Weather", "Other"]
-USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,20}$")
 EPS = 1e-9
-OWNER_USERNAME = "Kaushik"
+OWNER_USERNAME = os.environ.get("MAMS_OWNER", "").strip().lower()
+LOGIN_CODE_LIFETIME = 10 * 60
+LOGIN_CODE_RESEND_DELAY = 60
+LOGIN_CODE_MAX_ATTEMPTS = 5
+LOGIN_SETUP_LIFETIME = 15 * 60
 
 
 def _secret_key():
@@ -121,6 +129,7 @@ def close_db(_exc):
 # Columns added after the first release. schema.sql only creates missing tables, so databases
 # created earlier get these through ALTER TABLE (see migrate).
 NEW_COLUMNS = {
+    "users": [("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAULT 0")],
     "markets": [("rules_source", "TEXT NOT NULL DEFAULT ''"), ("rules_otherwise", "TEXT NOT NULL DEFAULT ''"),
                 ("proposed_outcome_id", "INTEGER"), ("proposed_by", "INTEGER"), ("proposed_at", "TEXT"),
                 ("finalizes_at", "TEXT"), ("resolved_by", "INTEGER"),
@@ -203,6 +212,75 @@ def init_db():
     backfill_activity(db)
     shorten_dispute_windows(db)
     db.close()
+
+
+def load_login_directory():
+    """Load private participant identity data from deployment config or the ignored instance directory."""
+    raw = os.environ.get("MAMS_USER_DIRECTORY")
+    if raw:
+        entries = json.loads(raw)
+    else:
+        path = os.environ.get("MAMS_USER_DIRECTORY_FILE", os.path.join(INSTANCE_DIR, "login_roster.json"))
+        with open(path, encoding="utf-8") as directory_file:
+            entries = json.load(directory_file)
+    if not isinstance(entries, list):
+        raise ValueError("The user directory must be a JSON list.")
+    directory = {}
+    seen = set()
+    emails_seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("Each user directory entry must contain a name and email.")
+        name = entry.get("name")
+        email = entry.get("email")
+        if not isinstance(name, str) or not isinstance(email, str):
+            raise ValueError("Each user directory entry must contain a name and email.")
+        name = name.strip()
+        email = email.strip()
+        key = name.casefold()
+        email_key = email.casefold()
+        if (not name or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
+                or key in seen or email_key in emails_seen):
+            raise ValueError("The user directory contains a missing or duplicate name/email.")
+        directory[key] = {"name": name, "email": email}
+        seen.add(key)
+        emails_seen.add(email_key)
+    return directory
+
+
+def login_code_hash(username, code):
+    value = f"{username.casefold()}:{code}".encode()
+    return hmac.new(app.config["SECRET_KEY"].encode(), value, hashlib.sha256).hexdigest()
+
+
+def send_login_code_email(recipient, code):
+    if app.config.get("TESTING"):
+        raise RuntimeError("Email delivery is disabled during automated tests.")
+    if os.environ.get("MAMS_EMAIL_BACKEND", "smtp").strip().lower() == "console":
+        current_app.logger.warning("LOCAL VERIFICATION CODE for %s: %s", recipient, code)
+        return
+    host = os.environ.get("MAMS_SMTP_HOST", "").strip()
+    sender = os.environ.get("MAMS_SMTP_FROM", os.environ.get("MAMS_SMTP_USERNAME", "")).strip()
+    if not host or not sender:
+        raise RuntimeError("SMTP host and sender must be configured before email can be sent.")
+    port = int(os.environ.get("MAMS_SMTP_PORT", "587"))
+    message = EmailMessage()
+    message["Subject"] = "Your MAMS Prediction Market verification code"
+    message["From"] = sender
+    message["To"] = recipient
+    message.set_content(
+        f"Your MAMS Prediction Market verification code is {code}. "
+        "It expires in 10 minutes. If you did not request it, you can ignore this email."
+    )
+    with smtplib.SMTP(host, port, timeout=15) as server:
+        server.ehlo()
+        server.starttls(context=ssl.create_default_context())
+        server.ehlo()
+        smtp_username = os.environ.get("MAMS_SMTP_USERNAME", "")
+        smtp_password = os.environ.get("MAMS_SMTP_PASSWORD", "")
+        if smtp_username:
+            server.login(smtp_username, smtp_password)
+        server.send_message(message)
 
 
 init_db()
@@ -864,62 +942,203 @@ def until_filter(s):
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    next_url = request.form.get("next", "") if request.method == "POST" else request.args.get("next", "")
+    try:
+        directory = load_login_directory()
+    except (OSError, ValueError):
+        current_app.logger.exception("Unable to load the private login directory.")
+        flash("Login is temporarily unavailable. Please contact the site administrator.", "error")
+        return render_template("login.html", stage="select", names=[], next_url=next_url)
+
+    names = [entry["name"] for entry in directory.values()]
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-        if not USERNAME_RE.match(username):
-            flash("Username must be 3–20 characters: letters, numbers, _ . -", "error")
-        elif len(password) < 6:
-            flash("Password must be at least 6 characters.", "error")
-        elif password != request.form.get("confirm", ""):
-            flash("Passwords don't match.", "error")
-        elif rate_limited(("register", request.remote_addr), 40, 3600):
-            flash("Too many new accounts from this network. Try again in a while.", "error")
-        else:
-            db = get_db()
-            first_user = db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
-            is_admin = int((first_user and not OWNER_USERNAME) or username.lower() == OWNER_USERNAME
-                           or username.lower() in ADMIN_USERNAMES)
-            try:
-                db.execute("BEGIN IMMEDIATE")
-                cur = db.execute(
-                    "INSERT INTO users (username, password_hash, balance, is_admin, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (username, generate_password_hash(password), STARTING_BALANCE, is_admin, now_str()))
-                log_activity(db, cur.lastrowid, "signup", STARTING_BALANCE, None, "Starting balance")
-                db.execute("COMMIT")
-            except sqlite3.IntegrityError:
-                db.execute("ROLLBACK")
-                flash("That username is taken.", "error")
+        stage = request.form.get("stage", "select")
+    elif session.get("verified_login_name") and \
+            time.time() - session.get("verified_login_at", 0) <= LOGIN_SETUP_LIFETIME:
+        stage = "create_password"
+    elif session.get("pending_login_name"):
+        stage = "verify"
+    else:
+        stage = "select"
+    selected_name = session.get("verified_login_name") if stage == "create_password" else \
+        session.get("pending_login_name") if stage == "verify" else ""
+    if request.method == "POST":
+        name = request.form.get("username", "").strip()
+        entry = directory.get(name.casefold())
+        if stage == "back_to_select":
+            pending_name = session.pop("pending_login_name", "")
+            if pending_name:
+                get_db().execute("DELETE FROM login_challenges WHERE username = ?", (pending_name,))
+            session.pop("verified_login_name", None)
+            session.pop("verified_login_at", None)
+            return render_template("login.html", stage="select", names=names, next_url=next_url)
+        elif stage == "select":
+            session.pop("pending_login_name", None)
+            session.pop("verified_login_name", None)
+            session.pop("verified_login_at", None)
+            if entry is None:
+                flash("Select a name from the list.", "error")
+            elif rate_limited(("login-start-ip", request.remote_addr), 20, 3600) or \
+                    rate_limited(("login-start", entry["name"].casefold()), 3, 900):
+                flash("Too many login attempts. Please wait and try again.", "error")
             else:
+                user = get_db().execute("SELECT * FROM users WHERE username = ?", (entry["name"],)).fetchone()
+                if user:
+                    return render_template("login.html", stage="password", names=names,
+                                           selected_name=entry["name"], next_url=next_url)
+                existing = get_db().execute(
+                    "SELECT requested_at FROM login_challenges WHERE username = ?",
+                    (entry["name"],)).fetchone()
+                if existing and time.time() - existing["requested_at"] < LOGIN_CODE_RESEND_DELAY:
+                    flash("A verification code was just sent. Check your email and try it below.", "success")
+                    session["pending_login_name"] = entry["name"]
+                    return render_template("login.html", stage="verify", names=names,
+                                           selected_name=entry["name"], next_url=next_url)
+                code = f"{secrets.randbelow(1_000_000):06d}"
+                try:
+                    send_login_code_email(entry["email"], code)
+                except (OSError, RuntimeError, smtplib.SMTPException, ValueError):
+                    current_app.logger.exception("Unable to send a first-login verification code.")
+                    flash("Unable to send a verification email. Please try again later.", "error")
+                else:
+                    get_db().execute(
+                        "INSERT OR REPLACE INTO login_challenges "
+                        "(username, code_hash, expires_at, requested_at, attempts) VALUES (?, ?, ?, ?, 0)",
+                        (entry["name"], login_code_hash(entry["name"], code),
+                         time.time() + LOGIN_CODE_LIFETIME, time.time()))
+                    session["pending_login_name"] = entry["name"]
+                    session.pop("verified_login_name", None)
+                    session.pop("verified_login_at", None)
+                    flash("A verification code was sent to the email address on file.", "success")
+                    return render_template("login.html", stage="verify", names=names,
+                                           selected_name=entry["name"], next_url=next_url)
+        elif stage == "password":
+            user = get_db().execute("SELECT * FROM users WHERE username = ?", (entry["name"],)).fetchone() \
+                if entry else None
+            fail_key = ("login-fail", entry["name"].casefold() if entry else name.casefold())
+            recent_fails = [t for t in _hits.get(fail_key, []) if time.time() - t < 300]
+            if len(recent_fails) >= 10:
+                flash("Too many wrong passwords for this account. Wait 5 minutes and try again.", "error")
+                return render_template("login.html", stage="password", names=names,
+                                       selected_name=entry["name"] if entry else "", next_url=next_url)
+            elif user and check_password_hash(user["password_hash"], request.form.get("password", "")):
+                _hits.pop(fail_key, None)
+                session.clear()
+                session.permanent = True
+                session["uid"] = user["id"]
+                return redirect(next_url if next_url.startswith("/") and not next_url.startswith("//")
+                                else url_for("index"))
+            else:
+                rate_limited(fail_key, 10, 300)
+                flash("Wrong username or password.", "error")
+                return render_template("login.html", stage="password", names=names,
+                                       selected_name=entry["name"] if entry else "", next_url=next_url)
+        elif stage == "verify":
+            pending_name = session.get("pending_login_name", "")
+            entry = directory.get(pending_name.casefold())
+            challenge = get_db().execute(
+                "SELECT * FROM login_challenges WHERE username = ?", (pending_name,)).fetchone() if entry else None
+            if request.form.get("action") == "resend":
+                if not entry or not challenge:
+                    session.pop("pending_login_name", None)
+                    flash("Select your name to request a verification code.", "error")
+                    return render_template("login.html", stage="select", names=names, next_url=next_url)
+                if time.time() - challenge["requested_at"] < LOGIN_CODE_RESEND_DELAY:
+                    flash("Please wait before requesting another verification code.", "error")
+                    return render_template("login.html", stage="verify", names=names,
+                                           selected_name=entry["name"], next_url=next_url)
+                if rate_limited(("login-start-ip", request.remote_addr), 20, 3600) or \
+                        rate_limited(("login-start", entry["name"].casefold()), 3, 900):
+                    flash("Too many code requests. Please wait and try again.", "error")
+                    return render_template("login.html", stage="verify", names=names,
+                                           selected_name=entry["name"], next_url=next_url)
+                code = f"{secrets.randbelow(1_000_000):06d}"
+                try:
+                    send_login_code_email(entry["email"], code)
+                except (OSError, RuntimeError, smtplib.SMTPException, ValueError):
+                    current_app.logger.exception("Unable to resend a first-login verification code.")
+                    flash("Unable to send a verification email. Please try again later.", "error")
+                else:
+                    get_db().execute(
+                        "UPDATE login_challenges SET code_hash = ?, expires_at = ?, requested_at = ?, attempts = 0 "
+                        "WHERE username = ?",
+                        (login_code_hash(entry["name"], code), time.time() + LOGIN_CODE_LIFETIME,
+                         time.time(), entry["name"]))
+                    flash("A new verification code was sent to the email address on file.", "success")
+                return render_template("login.html", stage="verify", names=names,
+                                       selected_name=entry["name"], next_url=next_url)
+            if (not entry or not challenge or challenge["expires_at"] < time.time()
+                    or challenge["attempts"] >= LOGIN_CODE_MAX_ATTEMPTS):
+                flash("That verification code expired. Select your name to request another.", "error")
+                session.pop("pending_login_name", None)
+                return render_template("login.html", stage="select", names=names, next_url=next_url)
+            code = request.form.get("code", "").strip()
+            if not hmac.compare_digest(challenge["code_hash"], login_code_hash(entry["name"], code)):
+                get_db().execute(
+                    "UPDATE login_challenges SET attempts = attempts + 1 WHERE username = ?", (entry["name"],))
+                flash("That verification code is incorrect.", "error")
+                return render_template("login.html", stage="verify", names=names,
+                                       selected_name=entry["name"], next_url=next_url)
+            get_db().execute("DELETE FROM login_challenges WHERE username = ?", (entry["name"],))
+            session.pop("pending_login_name", None)
+            session["verified_login_name"] = entry["name"]
+            session["verified_login_at"] = time.time()
+            return render_template("login.html", stage="create_password", names=names,
+                                   selected_name=entry["name"], next_url=next_url)
+        elif stage == "create_password":
+            verified_name = session.get("verified_login_name", "")
+            entry = directory.get(verified_name.casefold())
+            verified_at = session.get("verified_login_at", 0)
+            if not entry or time.time() - verified_at > LOGIN_SETUP_LIFETIME:
+                session.pop("verified_login_name", None)
+                session.pop("verified_login_at", None)
+                flash("Your verification session expired. Select your name to start again.", "error")
+                return render_template("login.html", stage="select", names=names, next_url=next_url)
+            password = request.form.get("password", "")
+            if len(password) < 8:
+                flash("Password must be at least 8 characters.", "error")
+            elif password != request.form.get("confirm", ""):
+                flash("Passwords don't match.", "error")
+            elif get_db().execute("SELECT 1 FROM users WHERE username = ?", (entry["name"],)).fetchone():
+                session.pop("verified_login_name", None)
+                session.pop("verified_login_at", None)
+                flash("An account already exists for that name. Log in with its password.", "error")
+                return render_template("login.html", stage="select", names=names, next_url=next_url)
+            else:
+                db = get_db()
+                first_user = db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+                is_admin = int((first_user and not OWNER_USERNAME) or entry["name"].casefold() == OWNER_USERNAME
+                               or entry["name"].casefold() in ADMIN_USERNAMES)
+                try:
+                    db.execute("BEGIN IMMEDIATE")
+                    cur = db.execute(
+                        "INSERT INTO users (username, password_hash, email, email_verified, balance, is_admin, created_at) "
+                        "VALUES (?, ?, ?, 1, ?, ?, ?)",
+                        (entry["name"], generate_password_hash(password), entry["email"],
+                         STARTING_BALANCE, is_admin, now_str()))
+                    log_activity(db, cur.lastrowid, "signup", STARTING_BALANCE, None, "Starting balance")
+                    db.execute("COMMIT")
+                except sqlite3.IntegrityError:
+                    db.execute("ROLLBACK")
+                    flash("An account already exists for that name. Log in with its password.", "error")
+                    return render_template("login.html", stage="select", names=names, next_url=next_url)
                 session.clear()
                 session.permanent = True
                 session["uid"] = cur.lastrowid
                 flash(f"Welcome! You start with {STARTING_BALANCE:,.0f} {CURRENCY}."
                       + (" You're an admin, so you can create and resolve markets." if is_admin else ""), "success")
-                return redirect(url_for("index"))
-    return render_template("register.html")
-
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        name = request.form.get("username", "").strip()
-        fail_key = ("login-fail", name.lower())
-        recent_fails = [t for t in _hits.get(fail_key, []) if time.time() - t < 300]
-        if len(recent_fails) >= 10:
-            flash("Too many wrong passwords for this account. Wait 5 minutes and try again.", "error")
-            return render_template("login.html")
-        u = get_db().execute("SELECT * FROM users WHERE username = ?", (name,)).fetchone()
-        if u and check_password_hash(u["password_hash"], request.form.get("password", "")):
-            _hits.pop(fail_key, None)
-            session.clear()
-            session.permanent = True
-            session["uid"] = u["id"]
-            nxt = request.args.get("next", "")
-            return redirect(nxt if nxt.startswith("/") and not nxt.startswith("//") else url_for("index"))
-        rate_limited(fail_key, 10, 300)  # record the failure
-        flash("Wrong username or password.", "error")
-    return render_template("login.html")
+                return redirect(next_url if next_url.startswith("/") and not next_url.startswith("//")
+                                else url_for("index"))
+        else:
+            flash("That login step is no longer available. Start again.", "error")
+            stage = "select"
+    return render_template("login.html", stage=stage, names=names,
+                           selected_name=selected_name, next_url=next_url)
 
 
 @app.post("/logout")
@@ -1240,9 +1459,29 @@ def leaderboard():
     worth = net_worths(db)
     counts = {r["user_id"]: r["n"] for r in db.execute("SELECT user_id, COUNT(*) AS n FROM trades GROUP BY user_id")}
     users = db.execute("SELECT id, username, balance FROM users").fetchall()
-    board = sorted(({"username": u["username"], "worth": worth[u["id"]], "balance": u["balance"],
-                     "trades": counts.get(u["id"], 0), "is_me": g.user is not None and g.user["id"] == u["id"]}
-                    for u in users), key=lambda x: -x["worth"])
+    try:
+        roster = load_login_directory()
+    except (OSError, ValueError, json.JSONDecodeError):
+        roster = {}
+    by_name = {u["username"].casefold(): u for u in users}
+    board_by_name = {}
+    for key, entry in roster.items():
+        u = by_name.get(key)
+        if u:
+            board_by_name[key] = {"username": u["username"], "worth": worth[u["id"]],
+                                  "balance": u["balance"], "trades": counts.get(u["id"], 0),
+                                  "is_me": g.user is not None and g.user["id"] == u["id"]}
+        else:
+            board_by_name[key] = {"username": entry["name"], "worth": STARTING_BALANCE,
+                                  "balance": STARTING_BALANCE, "trades": 0,
+                                  "is_me": False}
+    for u in users:
+        key = u["username"].casefold()
+        if key not in board_by_name:
+            board_by_name[key] = {"username": u["username"], "worth": worth[u["id"]],
+                                  "balance": u["balance"], "trades": counts.get(u["id"], 0),
+                                  "is_me": g.user is not None and g.user["id"] == u["id"]}
+    board = sorted(board_by_name.values(), key=lambda x: -x["worth"])
     return render_template("leaderboard.html", board=board)
 
 

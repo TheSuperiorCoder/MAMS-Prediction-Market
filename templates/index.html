@@ -3,11 +3,11 @@
 {% if not user %}
 <section class="hero">
   <h1>Bet on what happens at Mass Academy.</h1>
-  <p>Sign up and get <strong>1,000 {{ CURRENCY }}</strong> of play money. Buy shares in the outcomes you believe in —
+  <p>Log in and get <strong>1,000 {{ CURRENCY }}</strong> of play money. Buy shares in the outcomes you believe in —
      each winning share pays out Ⓜ1 when the market resolves. Prices move as people trade, so they show what the whole
      school thinks will happen.</p>
   <div class="hero-actions">
-    <a class="btn" href="{{ url_for('register') }}">Get started</a>
+    <a class="btn" href="{{ url_for('login') }}">Log in to get started</a>
     <a class="btn btn-ghost" href="{{ url_for('how_it_works') }}">How it works</a>
   </div>
 </section>

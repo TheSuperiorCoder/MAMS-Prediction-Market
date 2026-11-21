@@ -20,7 +20,7 @@
       <a href="{{ url_for('index') }}" class="{{ 'active' if request.endpoint in ('index', 'market') }}">Markets</a>
       <a href="{{ url_for('leaderboard') }}" class="{{ 'active' if request.endpoint == 'leaderboard' }}">Leaderboard</a>
       <a href="{{ url_for('activity') }}" class="{{ 'active' if request.endpoint in ('activity', 'balance_history') }}">Activity</a>
-      {% if not user or request.endpoint == 'how_it_works' %}<a href="{{ url_for('how_it_works') }}" class="{{ 'active' if request.endpoint == 'how_it_works' }}">How it works</a>{% endif %}
+      <a href="{{ url_for('how_it_works') }}" class="{{ 'active' if request.endpoint == 'how_it_works' }}">How it works</a>
       {% if user %}
         <a href="{{ url_for('portfolio') }}" class="{{ 'active' if request.endpoint == 'portfolio' }}">Portfolio</a>
         <a href="{{ url_for('propose') }}" class="{{ 'active' if request.endpoint == 'propose' }}">Propose</a>
@@ -44,7 +44,6 @@
         </form>
       {% else %}
         <a class="btn btn-small btn-ghost" href="{{ url_for('login') }}">Log in</a>
-        <a class="btn btn-small" href="{{ url_for('register') }}">Sign up</a>
       {% endif %}
     </div>
   </div>

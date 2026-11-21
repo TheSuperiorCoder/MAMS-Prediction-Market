@@ -38,16 +38,11 @@
     When the number is announced, the winning side's shares pay Ⓜ1 each. If it lands exactly on the line, nobody wins
     and everyone is refunded.</p>
 
-  <h2>Making markets (and earning from them)</h2>
+  <h2>Making markets</h2>
   <ul>
-    <li>Proposing a market costs <b>Ⓜ{{ CREATION_FEE|int }}</b>. You get it back if you withdraw the proposal, but not
-      if an admin rejects it, so only propose questions people will want to bet on.</li>
-    <li>You also have to <b>bet at least Ⓜ{{ CREATOR_MIN_BET|int }}</b> on your own market when you propose it. It's
-      held until an admin approves the market, then placed as a normal bet. If the proposal is rejected or withdrawn,
-      it comes back.</li>
-    <li>Once your market is live, every trader pays you <b>Ⓜ{{ ENTRY_FEE|int }}</b> on their first bet in it.
-      Ten traders earn you Ⓜ{{ (ENTRY_FEE * 10)|int }}.</li>
-    <li>If a market is cancelled or deleted, entry fees go back to the traders.</li>
+    <li>Anyone with an account can propose a clear, checkable question.</li>
+    <li>An admin reviews proposals before they go live.</li>
+    <li>Market creators can bet on their own markets, subject to the same rules and balances as every other trader.</li>
   </ul>
 
   <h2>Read the rules, not just the title</h2>

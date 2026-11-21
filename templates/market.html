@@ -156,7 +156,7 @@
         <p class="muted small center">Balance Ⓜ{{ user.balance|money }} · <a href="{{ url_for('how_it_works') }}">How does this work?</a></p>
       </form>
       {% else %}
-        <p><a href="{{ url_for('login', next=request.path) }}">Log in</a> or <a href="{{ url_for('register') }}">sign up</a> to bet.</p>
+        <p><a href="{{ url_for('login', next=request.path) }}">Log in</a> to bet.</p>
       {% endif %}
     </div>
     {% elif b.state == 'resolved' %}

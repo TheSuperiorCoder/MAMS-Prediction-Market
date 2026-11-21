@@ -58,9 +58,39 @@ def csrf(resp):
 
 
 def signup(client, name):
-    tok = csrf(client.get("/register"))
-    return client.post("/register", data={"csrf_token": tok, "username": name, "password": "secret1",
-                                          "confirm": "secret1"}, follow_redirects=True)
+    db = appmod.connect()
+    first_user = db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+    is_admin = int((first_user and not appmod.OWNER_USERNAME) or name.lower() == appmod.OWNER_USERNAME
+                   or name.lower() in appmod.ADMIN_USERNAMES)
+    cur = db.execute(
+        "INSERT INTO users (username, password_hash, balance, is_admin, created_at) VALUES (?, ?, ?, ?, ?)",
+        (name, appmod.generate_password_hash("secret1"), appmod.STARTING_BALANCE, is_admin, appmod.now_str()))
+    appmod.log_activity(db, cur.lastrowid, "signup", appmod.STARTING_BALANCE, None, "Starting balance")
+    with client.session_transaction() as user_session:
+        user_session.permanent = True
+        user_session["uid"] = cur.lastrowid
+    db.close()
+
+
+def test_leaderboard_and_how_it_works_render_for_everyone(monkeypatch, tmp_path):
+    old_db = appmod.DB_PATH
+    appmod.DB_PATH = str(tmp_path / "public-pages.db")
+    appmod.init_db()
+    appmod._hits.clear()
+    try:
+        client = appmod.app.test_client()
+        page = client.get("/leaderboard")
+        html = page.get_data(as_text=True)
+        assert page.status_code == 200
+        assert "Nobody has signed up yet" not in html
+        assert html.count('class="rank"') == 50
+
+        guide = client.get("/how-it-works")
+        assert guide.status_code == 200
+        assert "Prices are probabilities" in guide.get_data(as_text=True)
+        assert 'How it works' in client.get("/").get_data(as_text=True)
+    finally:
+        appmod.DB_PATH = old_db
 
 
 def test_full_flow(monkeypatch):
@@ -218,21 +248,206 @@ def test_admin_edit():
         appmod.DB_PATH = old
 
 
-def test_login_lockout_after_repeated_failures():
+def test_login_lockout_after_repeated_failures(monkeypatch):
+    monkeypatch.setattr(appmod, "load_login_directory", lambda: {
+        "lockme": {"name": "lockme", "email": "lockme@example.invalid"}
+    })
     client = appmod.app.test_client()
     signup(client, "lockme")
     client = appmod.app.test_client()
     for _ in range(10):
-        r = client.post("/login", data={"csrf_token": csrf(client.get("/login")), "username": "lockme",
+        r = client.post("/login", data={"csrf_token": csrf(client.get("/login")), "stage": "password",
+                                        "username": "lockme",
                                         "password": "wrong"})
         assert "Wrong username or password." in r.get_data(as_text=True)
-    r = client.post("/login", data={"csrf_token": csrf(client.get("/login")), "username": "lockme",
+    r = client.post("/login", data={"csrf_token": csrf(client.get("/login")), "stage": "password",
+                                    "username": "lockme",
                                     "password": "secret1"})
     assert "Too many wrong passwords" in r.get_data(as_text=True)
     appmod._hits.clear()
-    r = client.post("/login", data={"csrf_token": csrf(client.get("/login")), "username": "lockme",
+    r = client.post("/login", data={"csrf_token": csrf(client.get("/login")), "stage": "password",
+                                    "username": "lockme",
                                     "password": "secret1"})
     assert r.status_code == 302
+
+
+def test_roster_first_login_email_verification_and_returning_password(monkeypatch, tmp_path):
+    old_db = appmod.DB_PATH
+    appmod.DB_PATH = str(tmp_path / "login.db")
+    appmod.init_db()
+    monkeypatch.setattr(appmod, "OWNER_USERNAME", "")
+    monkeypatch.setattr(appmod, "load_login_directory", lambda: {
+        "test participant": {"name": "Test Participant", "email": "test-recipient@example.invalid"}
+    })
+    sent = []
+    monkeypatch.setattr(appmod, "send_login_code_email", lambda address, code: sent.append((address, code)))
+    appmod._hits.clear()
+    try:
+        client = appmod.app.test_client()
+        page = client.get("/login")
+        html = page.get_data(as_text=True)
+        assert "Test Participant" in html
+        assert "test-recipient@example.invalid" not in html
+
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "select", "username": "Test Participant"
+        })
+        assert "verification code was sent" in page.get_data(as_text=True)
+        assert 'value="resend"' in page.get_data(as_text=True)
+        assert len(sent) == 1
+        assert sent[0][0] == "test-recipient@example.invalid"
+        original_code = sent[0][1]
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "verify", "action": "resend"
+        })
+        assert "Please wait before requesting another" in page.get_data(as_text=True)
+        assert len(sent) == 1
+        monkeypatch.setattr(appmod, "LOGIN_CODE_RESEND_DELAY", 0)
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "verify", "action": "resend"
+        })
+        assert "new verification code was sent" in page.get_data(as_text=True)
+        assert len(sent) == 2
+        code = sent[1][1]
+        assert len(code) == 6 and code.isdigit()
+
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "verify", "code": original_code
+        })
+        assert "incorrect" in page.get_data(as_text=True)
+        wrong_code = "000000" if code != "000000" else "000001"
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "verify", "code": wrong_code
+        })
+        assert "incorrect" in page.get_data(as_text=True)
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "verify", "code": code
+        })
+        assert "Create your password" in page.get_data(as_text=True)
+        page = client.get("/login")
+        assert "Email verified" in page.get_data(as_text=True)
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "create_password",
+            "password": "short", "confirm": "short"
+        })
+        assert "at least 8 characters" in page.get_data(as_text=True)
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "create_password",
+            "password": "long-test-password", "confirm": "long-test-password"
+        })
+        assert page.status_code == 302
+        db = appmod.connect()
+        account = db.execute(
+            "SELECT email, email_verified, is_admin FROM users WHERE username = 'Test Participant'"
+        ).fetchone()
+        assert account["email"] == "test-recipient@example.invalid"
+        assert account["email_verified"] == 1
+        assert account["is_admin"] == 1
+
+        client.post("/logout", data={"csrf_token": csrf(client.get("/"))})
+        page = client.get("/login")
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "select", "username": "Test Participant"
+        })
+        assert "Welcome back" in page.get_data(as_text=True)
+        assert len(sent) == 2
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "password", "username": "Test Participant",
+            "password": "long-test-password"
+        })
+        assert page.status_code == 302
+        db.close()
+    finally:
+        appmod.DB_PATH = old_db
+
+
+def test_back_from_selected_name_returns_to_selection_and_clears_challenge(monkeypatch, tmp_path):
+    old_db = appmod.DB_PATH
+    appmod.DB_PATH = str(tmp_path / "login-back.db")
+    appmod.init_db()
+    monkeypatch.setattr(appmod, "load_login_directory", lambda: {
+        "first participant": {"name": "First Participant", "email": "first@example.invalid"},
+        "second participant": {"name": "Second Participant", "email": "second@example.invalid"},
+    })
+    sent = []
+    monkeypatch.setattr(appmod, "send_login_code_email", lambda address, code: sent.append((address, code)))
+    appmod._hits.clear()
+    try:
+        client = appmod.app.test_client()
+        page = client.get("/login")
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "select", "username": "First Participant"
+        })
+        assert "First Participant" in page.get_data(as_text=True)
+        assert "Back to name selection" in page.get_data(as_text=True)
+        assert len(sent) == 1
+
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "back_to_select"
+        })
+        html = page.get_data(as_text=True)
+        assert "Second Participant" in html
+        assert "value=\"resend\"" not in html
+        db = appmod.connect()
+        assert db.execute("SELECT COUNT(*) FROM login_challenges").fetchone()[0] == 0
+        db.close()
+
+        page = client.post("/login", data={
+            "csrf_token": csrf(page), "stage": "select", "username": "Second Participant"
+        })
+        assert "Second Participant" in page.get_data(as_text=True)
+        assert sent[1][0] == "second@example.invalid"
+    finally:
+        appmod.DB_PATH = old_db
+
+
+def test_email_is_disabled_during_automated_tests(monkeypatch):
+    monkeypatch.setitem(appmod.app.config, "TESTING", True)
+    with pytest.raises(RuntimeError, match="disabled during automated tests"):
+        appmod.send_login_code_email("anyone@example.invalid", "123456")
+
+
+def test_console_email_backend_prints_code_without_sending(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setitem(appmod.app.config, "TESTING", False)
+    monkeypatch.setenv("MAMS_EMAIL_BACKEND", "console")
+    monkeypatch.delenv("MAMS_SMTP_HOST", raising=False)
+    with appmod.app.app_context(), caplog.at_level(logging.WARNING, logger="app"):
+        appmod.send_login_code_email("anyone@example.invalid", "123456")
+    assert "LOCAL VERIFICATION CODE for anyone@example.invalid: 123456" in caplog.text
+
+
+def test_email_can_be_sent_to_any_configured_directory_recipient(monkeypatch):
+    sent = []
+
+    class SMTPStub:
+        def __init__(self, _host, _port, timeout):
+            assert timeout == 15
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def ehlo(self):
+            pass
+
+        def starttls(self, context):
+            assert context is not None
+
+        def send_message(self, message):
+            sent.append(message)
+
+    monkeypatch.setitem(appmod.app.config, "TESTING", False)
+    monkeypatch.setenv("MAMS_SMTP_HOST", "smtp.example.invalid")
+    monkeypatch.setenv("MAMS_SMTP_FROM", "noreply@example.invalid")
+    monkeypatch.setattr(appmod.smtplib, "SMTP", SMTPStub)
+
+    appmod.send_login_code_email("any-directory-user@example.invalid", "123456")
+    assert len(sent) == 1
+    assert sent[0]["To"] == "any-directory-user@example.invalid"
 
 
 def test_uses_school_timezone():
