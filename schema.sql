@@ -346,3 +346,22 @@ CREATE TABLE IF NOT EXISTS credit_history (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_credit_history_user ON credit_history(user_id, created_at);
+
+-- Standing buy/sell limit orders. Cash is NOT locked upfront; orders fill up to limit_price when triggered
+-- and are skipped (staying open) if filling would put the user into debt or exceed held shares.
+CREATE TABLE IF NOT EXISTS limit_orders (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    market_id   INTEGER NOT NULL REFERENCES markets(id),
+    outcome_id  INTEGER NOT NULL REFERENCES outcomes(id),
+    action      TEXT NOT NULL,                  -- buy | sell
+    limit_price REAL NOT NULL,                  -- target probability (0.01..0.99)
+    amount      REAL NOT NULL,                  -- original coins (buy) or shares (sell)
+    remaining   REAL NOT NULL,                  -- unfilled coins (buy) or shares (sell)
+    status      TEXT NOT NULL DEFAULT 'open',   -- open | filled | cancelled
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_limit_orders_market ON limit_orders(market_id, status);
+CREATE INDEX IF NOT EXISTS idx_limit_orders_user ON limit_orders(user_id, status);
+

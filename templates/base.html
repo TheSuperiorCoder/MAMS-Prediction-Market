@@ -36,6 +36,7 @@
   {%- elif name == 'install' %}<rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path d="M12 7v7M9 11l3 3 3-3"/><path d="M10 18.5h4"/>
   {%- elif name == 'loans' %}<path d="M4 8h13l-3-3"/><path d="M20 16H7l3 3"/>
   {%- elif name == 'mail' %}<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>
+  {%- elif name == 'user' %}<circle cx="12" cy="8" r="4"/><path d="M4 20a8 8 0 0 1 16 0"/>
   {%- endif %}
 </svg>
 {%- endmacro %}
@@ -79,7 +80,7 @@
             <a href="{{ url_for('portfolio') }}">{{ icon('portfolio') }}Portfolio</a>
             <a href="{{ url_for('balance_history') }}">{{ icon('history') }}Balance history</a>
             <a href="{{ url_for('loans') }}">{{ icon('loans') }}Loans</a>
-            <a href="{{ url_for('account_email') }}">{{ icon('mail') }}Change email</a>
+            <a href="{{ url_for('account_email') }}">{{ icon('user') }}Profile</a>
             <button type="button" data-install hidden>{{ icon('install') }}Install app</button>
             <form method="post" action="{{ url_for('logout') }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -187,7 +188,7 @@
     {% if user.is_admin %}<a href="{{ url_for('admin') }}" {% if request.endpoint in ('admin', 'admin_review', 'admin_edit', 'admin_user', 'admin_log', 'admin_credit') %}class="active"{% endif %}>{{ icon('admin') }}Admin{% if pending_proposals %} <span class="badge">{{ pending_proposals }}</span>{% endif %}</a>{% endif %}
     <a href="{{ url_for('balance_history') }}">{{ icon('history') }}Balance history</a>
     <a href="{{ url_for('how_it_works') }}" {% if request.endpoint == 'how_it_works' %}class="active"{% endif %}>{{ icon('guide') }}How it works</a>
-    <a href="{{ url_for('account_email') }}">{{ icon('mail') }}Change email</a>
+    <a href="{{ url_for('account_email') }}">{{ icon('user') }}Profile</a>
     <button type="button" class="sheet-install" data-install hidden>{{ icon('install') }}Install the app</button>
   </nav>
   <div class="sheet-account">

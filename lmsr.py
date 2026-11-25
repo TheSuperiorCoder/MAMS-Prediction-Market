@@ -128,3 +128,43 @@ def quote_sell_cents(q_centi, b, i, sell_shares_centi):
     proceeds = sell_value(q, b, i, sell_shares_centi / SHARES_SCALE)
     return max(0, math.floor(proceeds * CENTS_PER_COIN))
 
+
+def max_buy_shares_to_price_centi(q_centi, b, i, target_price):
+    """Maximum integer centi-shares of outcome i buyable without pushing price_i above target_price."""
+    if not (0.0 < target_price < 1.0):
+        raise ValueError("target_price must be strictly between 0 and 1")
+    q = [x / SHARES_SCALE for x in q_centi]
+    p = prices(q, b)[i]
+    if p >= target_price:
+        return 0
+    # In LMSR, p'/(1-p') = exp(dq/b) * p/(1-p), so dq = b * ln(p'(1-p) / (p(1-p'))).
+    dq = b * (math.log(target_price / (1.0 - target_price)) - math.log(p / (1.0 - p)))
+    sc = max(0, math.floor(dq * SHARES_SCALE))
+    while sc > 0:
+        q2 = list(q)
+        q2[i] += sc / SHARES_SCALE
+        if prices(q2, b)[i] <= target_price + 1e-12:
+            break
+        sc -= 1
+    return sc
+
+
+def max_sell_shares_to_price_centi(q_centi, b, i, target_price):
+    """Maximum integer centi-shares of outcome i sellable without pushing price_i below target_price."""
+    if not (0.0 < target_price < 1.0):
+        raise ValueError("target_price must be strictly between 0 and 1")
+    q = [x / SHARES_SCALE for x in q_centi]
+    p = prices(q, b)[i]
+    if p <= target_price:
+        return 0
+    dq = b * (math.log(p / (1.0 - p)) - math.log(target_price / (1.0 - target_price)))
+    sc = min(int(q_centi[i]), max(0, math.floor(dq * SHARES_SCALE)))
+    while sc > 0:
+        q2 = list(q)
+        q2[i] -= sc / SHARES_SCALE
+        if prices(q2, b)[i] >= target_price - 1e-12:
+            break
+        sc -= 1
+    return sc
+
+

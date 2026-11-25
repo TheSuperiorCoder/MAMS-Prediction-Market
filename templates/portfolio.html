@@ -49,6 +49,52 @@
   {% endif %}
 </div>
 
+<div class="card" id="limit-orders">
+  <div class="card-head">
+    <h2>Open limit orders <span class="muted small">{{ limit_orders|length }}</span></h2>
+    {% if limit_orders %}
+    <form method="post" action="{{ url_for('cancel_all_limit_orders_route') }}"
+          data-confirm="All {{ limit_orders|length }} of your open limit orders will be cancelled."
+          data-confirm-title="Cancel all limit orders?" data-confirm-label="Cancel all">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="btn btn-small btn-danger">Cancel all</button>
+    </form>
+    {% endif %}
+  </div>
+  {% if limit_orders %}
+  <div class="table-scroll">
+  <table class="table stack-mobile">
+    <thead><tr><th>Market</th><th>Side</th><th>Outcome</th><th class="num">Target</th><th class="num">Current</th><th class="num">Remaining</th><th></th></tr></thead>
+    <tbody>
+    {% for lo in limit_orders %}
+      <tr>
+        <td data-label="Market"><a href="{{ url_for('market', mid=lo.market_id) }}">{{ lo.question }}</a>
+          {% if lo.state != 'open' %}<span class="status status-closed">{{ lo.state }}</span>{% endif %}</td>
+        <td data-label="Side"><span class="kind kind-{{ lo.action }}">{{ 'Buy' if lo.action == 'buy' else 'Sell' }}</span></td>
+        <td data-label="Outcome">{{ lo.label }}</td>
+        <td class="num" data-label="Target">{{ '≤' if lo.action == 'buy' else '≥' }} {{ (lo.limit_price * 100)|round(1) }}%</td>
+        <td class="num" data-label="Current">{{ lo.current_price|pct }}</td>
+        <td class="num" data-label="Remaining">
+          {% if lo.action == 'buy' %}Ⓜ{{ lo.remaining|money }}{% if lo.remaining < lo.amount %} <span class="muted small">/ Ⓜ{{ lo.amount|money }}</span>{% endif %}
+          {% else %}{{ lo.remaining|money }} sh{% if lo.remaining < lo.amount %} <span class="muted small">/ {{ lo.amount|money }}</span>{% endif %}{% endif %}
+        </td>
+        <td class="num">
+          <form method="post" action="{{ url_for('cancel_limit_order_route', oid=lo.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="next" value="{{ url_for('portfolio') }}#limit-orders">
+            <button class="btn btn-small btn-ghost">Cancel</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="muted">No open limit orders. Place one on any open market by switching from Market to Limit.</p>
+  {% endif %}
+</div>
+
 {% if settled %}
 <div class="card">
   <h2>Settled</h2>
@@ -105,7 +151,7 @@
     <tbody>
     {% for t in trades %}
       <tr>
-        <td><span class="kind kind-{{ 'buy' if t.shares > 0 else 'sell' }}">{% if t.via == 'loan' %}{{ 'Took over' if t.shares > 0 else 'Handed over (loan)' }}{% else %}{{ 'Bought' if t.shares > 0 else 'Sold' }}{% endif %}</span>
+        <td><span class="kind kind-{{ 'buy' if t.shares > 0 else 'sell' }}">{% if t.via == 'loan' %}{{ 'Took over' if t.shares > 0 else 'Handed over (loan)' }}{% elif t.via == 'limit' %}{{ 'Limit buy' if t.shares > 0 else 'Limit sell' }}{% else %}{{ 'Bought' if t.shares > 0 else 'Sold' }}{% endif %}</span>
           {{ t.shares|abs|money }} × {{ t.label }} — <a href="{{ url_for('market', mid=t.market_id) }}">{{ t.question }}</a></td>
         <td class="num">{{ '−' if t.amount > 0 else '+' }}Ⓜ{{ t.amount|abs|money }}</td>
         <td class="num muted small">{{ t.created_at|ago }}</td>

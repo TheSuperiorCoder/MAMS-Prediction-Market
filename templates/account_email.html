@@ -1,45 +1,79 @@
 {% extends "base.html" %}
-{% block title %}Confirm your email · MAMS Prediction Market{% endblock %}
+{% block title %}Profile · MAMS Prediction Market{% endblock %}
 {% block content %}
-<div class="auth card">
-  <span class="logo" aria-hidden="true">{% with logo_id='email' %}{% include '_logo.html' %}{% endwith %}</span>
-  <h1>{% if current %}Change your email{% else %}Confirm your email{% endif %}</h1>
+<div class="page-head">
+  <div>
+    <h1>Profile</h1>
+    <p class="muted">Manage your display name, email address, and password.</p>
+  </div>
+  {% if current %}
+  <a class="btn btn-small btn-ghost" href="{{ url_for('portfolio') }}">← Portfolio</a>
+  {% endif %}
+</div>
+
+<div class="card settings-card" id="name">
+  <h2>Name</h2>
+  <p class="muted">Signed in as <strong>{{ user.username }}</strong>. 3–20 characters (letters, numbers, <code>_</code>, <code>-</code>, <code>.</code>).</p>
+  <form method="post" action="{{ url_for('change_username') }}" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label class="field"><span>New name</span>
+      <input name="username" value="{{ user.username }}" required minlength="3" maxlength="20" pattern="[A-Za-z0-9_.\-]{3,20}" autocomplete="username">
+    </label>
+    <button class="btn">Save name</button>
+  </form>
+</div>
+
+<div class="card settings-card" id="email">
+  <h2>Email</h2>
   {% if pending %}
     <p class="muted">Enter the 6-digit code we sent to <strong>{{ pending }}</strong>.</p>
-    <form method="post" class="stack">
+    <form method="post" action="{{ url_for('account_email') }}" class="stack">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="action" value="verify">
       <label class="field"><span>Code</span>
         <input name="code" required autofocus inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
       </label>
-      <button class="btn btn-block">Confirm</button>
+      <button class="btn">Confirm email</button>
     </form>
     <div class="row-actions" style="margin-top:12px">
-      <form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <form method="post" action="{{ url_for('account_email') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="action" value="resend"><button class="btn btn-small btn-ghost">Send a new code</button></form>
-      <form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <form method="post" action="{{ url_for('account_email') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="action" value="change"><button class="btn btn-small btn-ghost">Use a different email</button></form>
     </div>
   {% else %}
     {% if current %}
-      <p class="muted">Your email is <strong>{{ current }}</strong>. To change it, enter the new one.</p>
+      <p class="muted">Your email is <strong>{{ current }}</strong>. To change it, enter the new address and confirm the 6-digit code.</p>
     {% else %}
-      <p class="muted">Add your email to keep using the site. We'll send you a code to confirm it.</p>
+      <p class="muted">Add your email to confirm your account. We'll send you a code to confirm it.</p>
     {% endif %}
-    <form method="post" class="stack">
+    <form method="post" action="{{ url_for('account_email') }}" class="stack">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="action" value="send">
-      <label class="field"><span>Email</span>
-        <input type="email" name="email" required autofocus autocomplete="email">
+      <label class="field"><span>{{ 'New email' if current else 'Email' }}</span>
+        <input type="email" name="email" required autocomplete="email" placeholder="you@example.com">
       </label>
-      <button class="btn btn-block">Send code</button>
+      <button class="btn">Send verification code</button>
     </form>
   {% endif %}
-  {% if not current %}
-    <form method="post" action="{{ url_for('logout') }}" style="margin-top:12px">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <button class="btn btn-small btn-ghost">Log out</button>
-    </form>
-  {% endif %}
+</div>
+
+<div class="card settings-card" id="password">
+  <h2>Password</h2>
+  <p class="muted">Changing your password signs out all other devices.</p>
+  <form method="post" action="{{ url_for('change_password') }}" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="next" value="{{ url_for('account_email') }}#password">
+    <label class="field"><span>Current password</span>
+      <input type="password" name="current" autocomplete="current-password" required>
+    </label>
+    <label class="field"><span>New password (at least 6 characters)</span>
+      <input type="password" name="new" autocomplete="new-password" minlength="6" required>
+    </label>
+    <label class="field"><span>Confirm new password</span>
+      <input type="password" name="confirm" autocomplete="new-password" minlength="6" required>
+    </label>
+    <button class="btn">Change password</button>
+  </form>
 </div>
 {% endblock %}

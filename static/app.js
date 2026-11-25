@@ -218,6 +218,10 @@ function drawChart(el, history, allLabels, endTime, lines, tz, colors) {
 function setupTradeForm(form) {
   if (!form) return;
   const actionInput = form.querySelector('input[name=action]');
+  const orderTypeInput = form.querySelector('input[name=order_type]');
+  const limitField = form.querySelector('#limit-pct-field');
+  const limitInput = form.querySelector('#limit-pct');
+  const limitHint = form.querySelector('#limit-hint');
   const valueInput = form.querySelector('#value');
   const valueLabel = form.querySelector('#value-label');
   const prefix = form.querySelector('#value-prefix');
@@ -239,6 +243,7 @@ function setupTradeForm(form) {
 
   const selected = () => form.querySelector('input[name=outcome_id]:checked');
   const outcomeName = () => selected().dataset.label;
+  const currentPrice = () => parseFloat(selected().dataset.price) || 0;
   const held = () => parseFloat(selected().dataset.held) || 0;
   const paid = () => parseFloat(selected().dataset.paid) || 0;  // what you spent on the shares you still hold
   const row = (label, value, cls = '') => `<div class="${cls}"><span>${label}</span><b>${value}</b></div>`;
@@ -246,20 +251,98 @@ function setupTradeForm(form) {
   const big = (key, n, sub = '') => `<span class="win-val"><b data-tween="${key}" data-v="${n}">${money(n)}</b>${sub}</span>`;
   const money = n => `Ⓜ${fmt(n)}`;
   const signed = n => `${n >= 0 ? '+' : '−'}${money(Math.abs(n))}`;
-  const defaultButton = () => `${isBuy() ? 'Buy' : 'Sell'} “${outcomeName()}”`;
   const isBuy = () => actionInput.value === 'buy';
+  const isLimit = () => orderTypeInput && orderTypeInput.value === 'limit';
+  const defaultButton = () => isLimit()
+    ? `Place limit ${isBuy() ? 'buy' : 'sell'} for “${outcomeName()}”`
+    : `${isBuy() ? 'Buy' : 'Sell'} “${outcomeName()}”`;
+
+  function updateLimitHint() {
+    if (!limitHint || !isLimit()) return;
+    const curPct = Math.round(currentPrice() * 100);
+    const pct = parseFloat(limitInput.value);
+    const targetTxt = (pct >= 1 && pct <= 99) ? `${pct}%` : 'your target %';
+    limitHint.textContent = isBuy()
+      ? `Activates when “${outcomeName()}” is at or below ${targetTxt} (now ${curPct}%).`
+      : `Activates when “${outcomeName()}” is at or above ${targetTxt} (now ${curPct}%).`;
+  }
+
+  function renderLimitPreview() {
+    clearTimeout(timer);
+    if (ctrl) ctrl.abort();
+    minOut.value = '';
+    preview.classList.remove('stale');
+    quoted = null; clearShown();
+    updateLimitHint();
+    const v = parseFloat(valueInput.value);
+    const pct = parseFloat(limitInput.value);
+    if (!(pct >= 1 && pct <= 99)) {
+      setPreview('<span class="muted">Enter a target probability between 1% and 99%.</span>', false);
+      return;
+    }
+    if (!(v > 0)) {
+      setPreview(`<span class="muted">${isBuy() ? 'Enter an amount to spend.' : 'Enter shares to sell.'}</span>`, false);
+      return;
+    }
+    if (isBuy() && v < 1) {
+      setPreview('<span class="down">Minimum bet is Ⓜ1.</span>', false);
+      return;
+    }
+    const pTarget = pct / 100;
+    const curP = currentPrice();
+    const immediate = isBuy() ? curP <= pTarget + 1e-9 : curP >= pTarget - 1e-9;
+    const name = outcomeName();
+    const pctStr = `${Math.round(pct * 10) / 10}%`;
+    if (isBuy()) {
+      const minShares = v / pTarget;
+      const warn = v + entryFee > balance
+        ? `<div class="down"><span>Balance note</span><b>Current balance (${money(balance)}) is lower; will only fill what you can afford.</b></div>`
+        : '';
+      setPreview(
+        row('Order type', immediate ? 'Limit buy (fills now up to limit)' : 'Limit buy (open until triggered)') +
+        row('Trigger price', `≤ ${pctStr} (now ${Math.round(curP * 100)}%)`) +
+        row('Max spend', money(v)) +
+        (entryFee ? row('Entry fee (on first fill)', money(entryFee)) : '') +
+        row('Min shares at limit', `${fmt(minShares)} shares`) +
+        row('Spendable balance', 'Unchanged until triggered') +
+        warn,
+        true, `Limit buy “${name}” ≤ ${pctStr}`
+      );
+    } else {
+      const minProceeds = v * pTarget;
+      const warn = v > held()
+        ? `<div class="down"><span>Holdings note</span><b>You own ${fmt(held())} shares; will only sell shares you hold when triggered.</b></div>`
+        : '';
+      setPreview(
+        row('Order type', immediate ? 'Limit sell (fills now up to limit)' : 'Limit sell (open until triggered)') +
+        row('Trigger price', `≥ ${pctStr} (now ${Math.round(curP * 100)}%)`) +
+        row('Shares to sell', `${fmt(v)} shares`) +
+        row('Min proceeds at limit', money(minProceeds)) +
+        warn,
+        true, `Limit sell “${name}” ≥ ${pctStr}`
+      );
+    }
+  }
 
   function refresh() {
     valueLabel.textContent = isBuy() ? 'Amount to spend' : `Shares to sell (you own ${fmt(held())})`;
     prefix.hidden = !isBuy();
     valueInput.placeholder = isBuy() ? '0' : '0 shares';
     quick.hidden = !isBuy();
+    if (limitField) {
+      limitField.hidden = !isLimit();
+      limitInput.required = isLimit();
+      if (isLimit() && !limitInput.value) {
+        limitInput.value = Math.min(99, Math.max(1, Math.round(currentPrice() * 100)));
+      }
+    }
     submit.textContent = defaultButton();
     // the button takes the colour of what you're doing: buying Yes (or any outcome) is green, buying No or selling is crimson
     const buyingNo = isBuy() && form.querySelector('.outcome-pick.binary') && selected() === form.querySelectorAll('input[name=outcome_id]')[1];
     submit.classList.toggle('btn-buy', isBuy() && !buyingNo);
     submit.classList.toggle('btn-sell', !isBuy() || !!buyingNo);
-    requestQuote();
+    if (isLimit()) renderLimitPreview();
+    else requestQuote();
   }
 
   function setPreview(html, canSubmit, buttonText) {
@@ -292,6 +375,7 @@ function setupTradeForm(form) {
   };
 
   function requestQuote() {
+    if (isLimit()) { renderLimitPreview(); return; }
     clearTimeout(timer);
     if (ctrl) ctrl.abort();  // drop any quote still in flight
     minOut.value = '';
@@ -318,7 +402,7 @@ function setupTradeForm(form) {
       const params = new URLSearchParams({ market: form.dataset.market, outcome: selected().value, action: actionInput.value, value: v });
       try {
         const res = await (await fetch(`${form.dataset.quote}?${params}`, { signal: ctrl.signal })).json();
-        if (keyFor(parseFloat(valueInput.value)) !== key) return;  // the input moved on while we waited
+        if (isLimit() || keyFor(parseFloat(valueInput.value)) !== key) return;  // the input moved on while we waited
         preview.classList.remove('stale');
         if (!res.ok) { quoted = null; clearShown(); setPreview(`<span class="down">${escapeHtml(res.error || 'Can\'t quote that trade.')}</span>`, false); return; }
         quoted = { key };
@@ -367,9 +451,9 @@ function setupTradeForm(form) {
     }, 150);
   }
 
-  form.querySelectorAll('.seg button').forEach(btn => btn.addEventListener('click', () => {
+  form.querySelectorAll('[data-seg="action"] button').forEach(btn => btn.addEventListener('click', () => {
     if (btn.dataset.action === actionInput.value) return;
-    form.querySelectorAll('.seg button').forEach(b => {
+    form.querySelectorAll('[data-seg="action"] button').forEach(b => {
       b.classList.toggle('active', b === btn);
       b.setAttribute('aria-pressed', b === btn ? 'true' : 'false');
     });
@@ -378,14 +462,30 @@ function setupTradeForm(form) {
     valueInput.step = isBuy() ? '0.01' : 'any';
     refresh();
   }));
-  form.querySelectorAll('input[name=outcome_id]').forEach(r => r.addEventListener('change', refresh));
+  form.querySelectorAll('[data-seg="order-type"] button').forEach(btn => btn.addEventListener('click', () => {
+    if (!orderTypeInput || btn.dataset.orderType === orderTypeInput.value) return;
+    form.querySelectorAll('[data-seg="order-type"] button').forEach(b => {
+      b.classList.toggle('active', b === btn);
+      b.setAttribute('aria-pressed', b === btn ? 'true' : 'false');
+    });
+    orderTypeInput.value = btn.dataset.orderType;
+    refresh();
+  }));
+  form.querySelectorAll('input[name=outcome_id]').forEach(r => r.addEventListener('change', () => {
+    if (limitInput && isLimit()) {
+      limitInput.value = Math.min(99, Math.max(1, Math.round(currentPrice() * 100)));
+    }
+    refresh();
+  }));
+  if (limitInput) limitInput.addEventListener('input', renderLimitPreview);
   valueInput.addEventListener('input', requestQuote);
   maxBtn.addEventListener('click', () => {
     valueInput.value = isBuy() ? maxBuy() : floor6(held());
     requestQuote();
   });
   quick.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
-    valueInput.value = round2(Math.min((parseFloat(valueInput.value) || 0) + parseFloat(b.dataset.amt), maxBuy()));
+    const cap = isLimit() ? Infinity : maxBuy();
+    valueInput.value = round2(Math.min((parseFloat(valueInput.value) || 0) + parseFloat(b.dataset.amt), cap));
     requestQuote();
   }));
   refresh();

@@ -148,7 +148,7 @@
               {% if t.user_id == b.m.created_by %}<span class="tag pill" title="Wrote this market">creator</span>{% endif %}
               {% if t.via == 'loan' %}{% if t.shares > 0 %}<span class="buy">took over</span>{% else %}<span class="sell">handed over</span>{% endif %}
               {% elif t.shares > 0 %}<span class="buy">bought</span>{% else %}<span class="sell">sold</span>{% endif %}
-              {{ t.shares|abs|money }} × {{ t.label }} <span class="trade-when">· {% if t.via == 'loan' %}overdue loan · {% endif %}{{ t.created_at|ago }}</span></span>
+              {{ t.shares|abs|money }} × {{ t.label }} <span class="trade-when">· {% if t.via == 'loan' %}overdue loan · {% elif t.via == 'limit' %}limit order · {% endif %}{{ t.created_at|ago }}</span></span>
             <span class="trade-amt">Ⓜ{{ t.amount|abs|money }}
               {% if user and user.is_admin and b.m.status == 'open' and t.shares > 0 and not t.via %}
               <form method="post" action="{{ url_for('admin_cancel_trade', tid=t.id) }}" class="inline"
@@ -228,10 +228,24 @@
             data-market="{{ b.m.id }}" data-quote="{{ url_for('quote') }}" data-entry-fee="{{ my_entry_fee }}" data-late-t="{{ late_t }}" data-snipe-rate="{{ LATE_SNIPE_RATE }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="action" value="buy">
+        <input type="hidden" name="order_type" value="market">
         <input type="hidden" name="min_out" id="min-out" value="">
-        <div class="seg" data-seg>
+        <div class="seg" data-seg="action">
           <button type="button" data-action="buy" class="active" aria-pressed="true">Buy</button>
           <button type="button" data-action="sell" aria-pressed="false">Sell</button>
+        </div>
+        <div class="order-type-row">
+          <div class="seg order-type-seg" data-seg="order-type">
+            <button type="button" data-order-type="market" class="active" aria-pressed="true">Market</button>
+            <button type="button" data-order-type="limit" aria-pressed="false">Limit</button>
+          </div>
+          <span class="info-tip" tabindex="0" role="button" aria-label="Market vs Limit orders info">
+            <span class="info-icon" aria-hidden="true">i</span>
+            <span class="info-pop" role="tooltip">
+              <strong>Market order:</strong> Executes right away at the current market price.<br><br>
+              <strong>Limit order:</strong> Sets a target probability (%). Buy limits activate at or below your target %; sell limits activate at or above your target %. Cash stays in your spendable balance until it triggers, and orders won't execute if they would put you into debt.
+            </span>
+          </span>
         </div>
         {% set chosen = pick or b.outcomes[0].id %}
         <div class="outcome-pick {{ 'binary' if b.binary }}" role="radiogroup" aria-label="Outcome">
@@ -243,6 +257,14 @@
               <span><i style="background: {{ ocolor(b, loop.index0) }}"></i>{{ o.label }}<b>{% if b.binary %}{{ (o.price * 100)|round|int }}¢{% else %}Ⓜ{{ '%.2f'|format(o.price) }}{% endif %}</b></span>
             </label>
           {% endfor %}
+        </div>
+        <div class="field" id="limit-pct-field" hidden>
+          <label for="limit-pct" id="limit-pct-label">Limit price (%)</label>
+          <div class="amount-box">
+            <input type="number" name="limit_pct" id="limit-pct" min="1" max="99" step="0.1" placeholder="50" autocomplete="off" inputmode="decimal">
+            <span class="suffix" aria-hidden="true">%</span>
+          </div>
+          <p class="muted small limit-hint" id="limit-hint"></p>
         </div>
         <div class="field">
           <label for="value" id="value-label">Amount to spend (Ⓜ)</label>
@@ -267,6 +289,34 @@
         </div>
       {% endif %}
     </div>
+    {% if user and my_limit_orders %}
+    <div class="card limit-card">
+      <div class="card-head">
+        <h2>Your open limits <span class="muted small">{{ my_limit_orders|length }}</span></h2>
+        <a class="small" href="{{ url_for('portfolio') }}#limit-orders">Manage all →</a>
+      </div>
+      <ul class="limit-list">
+        {% for lo in my_limit_orders %}
+        <li>
+          <div>
+            <span class="kind kind-{{ lo.action }}">{{ 'Buy' if lo.action == 'buy' else 'Sell' }}</span>
+            <strong>{{ lo.label }}</strong>
+            <span class="muted small">{{ '≤' if lo.action == 'buy' else '≥' }} {{ (lo.limit_price * 100)|round(1) }}%</span>
+            <div class="muted small">
+              {% if lo.action == 'buy' %}Ⓜ{{ lo.remaining|money }}{% if lo.remaining < lo.amount %} of Ⓜ{{ lo.amount|money }}{% endif %} left
+              {% else %}{{ lo.remaining|money }}{% if lo.remaining < lo.amount %} of {{ lo.amount|money }}{% endif %} shares left{% endif %}
+            </div>
+          </div>
+          <form method="post" action="{{ url_for('cancel_limit_order_route', oid=lo.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="next" value="{{ url_for('market', mid=b.m.id) }}">
+            <button class="btn btn-small btn-ghost">Cancel</button>
+          </form>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
     {% elif b.state == 'resolved' %}
     <div class="card result-card">
       <h2>Result</h2>

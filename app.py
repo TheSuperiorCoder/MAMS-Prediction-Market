@@ -1257,11 +1257,320 @@ def execute_trade(db, user_id, market_id, outcome_id, action, value, min_out=Non
         db.execute("INSERT INTO trades (user_id, market_id, outcome_id, shares, amount, created_at) "
                    "VALUES (?, ?, ?, ?, ?, ?)", (user_id, market_id, outcome_id, d_shares, -d_cash, now_str()))
         snapshot_prices(db, market_id, m["b"])
+        process_limit_orders(db, market_id)
         db.execute("COMMIT")
         return msg
     except Exception:
         db.execute("ROLLBACK")
         raise
+
+
+def _try_fill_limit_order(db, m, outs, idx, order):
+    """Attempt to fill a triggered limit order up to its limit_price without putting the user into debt
+    or exceeding held shares. Must be called inside an open transaction. Returns fill info dict or None."""
+    uid = order["user_id"]
+    market_id = m["id"]
+    outcome_id = order["outcome_id"]
+    action = order["action"]
+    limit_price = float(order["limit_price"])
+
+    if trade_block_reason(db, uid, market_id):
+        return None
+    if action == "buy" and overdue_block(db, uid):
+        return None
+
+    user = db.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+    if user is None:
+        return None
+    pos = db.execute("SELECT * FROM positions WHERE user_id = ? AND outcome_id = ?",
+                     (uid, outcome_id)).fetchone()
+    held = pos["shares"] if pos else 0.0
+    held_cost = pos["cost"] if pos else 0.0
+    held_centi = lmsr.to_centi_shares(held)
+    q_centi = [lmsr.to_centi_shares(o["shares"]) for o in outs]
+    q = [x / lmsr.SHARES_SCALE for x in q_centi]
+    t = late_multiplier(m)
+    label = outs[idx]["label"]
+
+    if action == "buy":
+        rem_cents = lmsr.to_cents(order["remaining"])
+        if rem_cents <= 0:
+            return None
+        fee = entry_fee_due(db, m, uid)
+        fee_cents = lmsr.to_cents(fee)
+        bal_cents = lmsr.to_cents(user["balance"])
+        if bal_cents <= fee_cents:
+            return None
+        max_sc_price = lmsr.max_buy_shares_to_price_centi(q_centi, m["b"], idx, limit_price)
+        if max_sc_price <= 0:
+            return None
+
+        # Cap shares by remaining order budget (coins before fees) and by user's available cash (never debt).
+        max_spend_cents = min(rem_cents, bal_cents - fee_cents)
+        if max_spend_cents <= 0:
+            return None
+        try:
+            max_sc_spend, _ = lmsr.quote_buy_cents(q_centi, m["b"], idx, max_spend_cents)
+        except ValueError:
+            return None
+
+        hi = min(max_sc_price, max_sc_spend)
+        if hi <= 0:
+            return None
+
+        def buy_total_cents(sc):
+            cost_c = math.ceil(lmsr.cost_for_shares(q, m["b"], idx, sc / lmsr.SHARES_SCALE) * lmsr.CENTS_PER_COIN)
+            if cost_c <= 0:
+                return 0, 0, 0
+            sh = sc / lmsr.SHARES_SCALE
+            amt = cost_c / lmsr.CENTS_PER_COIN
+            late_c = lmsr.to_cents(late_fee(sh, amt / sh, t, buy=True))
+            return cost_c, late_c, cost_c + fee_cents + late_c
+
+        cost_cents, late_cents, total_cents = buy_total_cents(hi)
+        if total_cents > bal_cents or cost_cents > rem_cents:
+            lo, best = 1, 0
+            while lo <= hi:
+                mid_sc = (lo + hi) // 2
+                c_c, l_c, tot_c = buy_total_cents(mid_sc)
+                if tot_c <= bal_cents and c_c <= rem_cents:
+                    best = mid_sc
+                    lo = mid_sc + 1
+                else:
+                    hi = mid_sc - 1
+            if best <= 0:
+                return None
+            shares_centi = best
+            cost_cents, late_cents, _ = buy_total_cents(shares_centi)
+        else:
+            shares_centi = hi
+
+        if shares_centi <= 0 or cost_cents <= 0:
+            return None
+
+        shares = lmsr.from_centi_shares(shares_centi)
+        coins = lmsr.from_cents(cost_cents)
+        late = lmsr.from_cents(late_cents)
+
+        if fee:
+            creator = creator_name(db, m)
+            db.execute("UPDATE users SET balance = ROUND(balance - ?, 2) WHERE id = ?", (fee, uid))
+            log_activity(db, uid, "fee", -fee, m, f"Entry fee (first bet), paid to {creator}")
+            db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (fee, m["created_by"]))
+            log_activity(db, m["created_by"], "earning", fee, m, f"Entry fee from {user['username']}")
+            db.execute("INSERT INTO market_entries (market_id, user_id, creator_id, fee, created_at) VALUES (?, ?, ?, ?, ?)",
+                       (market_id, uid, m["created_by"], fee, now_str()))
+
+        d_shares_centi, d_cash = shares_centi, -coins
+        new_shares = lmsr.from_centi_shares(held_centi + shares_centi)
+        new_cost = lmsr.from_cents(lmsr.to_cents(held_cost) + cost_cents)
+        detail = f"Limit buy: {shares:,.2f} shares of “{label}” (limit {limit_price * 100:.0f}%)"
+        new_rem_cents = max(0, rem_cents - cost_cents)
+        new_rem = lmsr.from_cents(new_rem_cents)
+        new_status = "filled" if new_rem_cents <= 0 else "open"
+
+    else:  # sell
+        rem_sc = lmsr.to_centi_shares(order["remaining"])
+        if rem_sc <= 0 or held_centi <= 0:
+            return None
+        max_sc_price = lmsr.max_sell_shares_to_price_centi(q_centi, m["b"], idx, limit_price)
+        if max_sc_price <= 0:
+            return None
+        shares_centi = min(max_sc_price, rem_sc, held_centi, q_centi[idx])
+        if shares_centi <= 0:
+            return None
+        proceeds_cents = lmsr.quote_sell_cents(q_centi, m["b"], idx, shares_centi)
+        if proceeds_cents < 1:
+            return None
+        shares = lmsr.from_centi_shares(shares_centi)
+        coins = lmsr.from_cents(proceeds_cents)
+        fee = 0.0
+        late = min(late_fee(shares, coins / shares, t, buy=False), coins)
+
+        d_shares_centi, d_cash = -shares_centi, coins
+        new_shares = lmsr.from_centi_shares(held_centi - shares_centi)
+        new_cost = held_cost * (new_shares / held) if held > 0 else 0.0
+        detail = f"Limit sell: {shares:,.2f} shares of “{label}” (limit {limit_price * 100:.0f}%)"
+        new_rem_sc = max(0, rem_sc - shares_centi)
+        new_rem = lmsr.from_centi_shares(new_rem_sc)
+        new_status = "filled" if new_rem_sc <= 0 else "open"
+
+    now = now_str()
+    d_shares = lmsr.from_centi_shares(d_shares_centi)
+    db.execute("UPDATE outcomes SET shares = ? WHERE id = ?",
+               (lmsr.from_centi_shares(q_centi[idx] + d_shares_centi), outcome_id))
+    db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (d_cash, uid))
+    log_activity(db, uid, action, d_cash, m, detail)
+    if late:
+        payee = m["created_by"] if m["created_by"] not in (None, uid) else None
+        payee_name = creator_name(db, m) if payee else None
+        db.execute("UPDATE users SET balance = ROUND(balance - ?, 2) WHERE id = ?", (late, uid))
+        log_activity(db, uid, "fee", -late, m,
+                     f"Late trading fee (×{fmt_number(t)}, {shares:,.2f} shares at {coins / shares * 100:.0f}¢)"
+                     + (f", paid to {payee_name}" if payee else ""))
+        if payee:
+            db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (late, payee))
+            log_activity(db, payee, "earning", late, m, f"Late trading fee from {user['username']}")
+    set_position(db, uid, outcome_id, new_shares, new_cost)
+    db.execute("INSERT INTO trades (user_id, market_id, outcome_id, shares, amount, created_at, via) "
+               "VALUES (?, ?, ?, ?, ?, ?, 'limit')",
+               (uid, market_id, outcome_id, d_shares, -d_cash, now))
+    db.execute("UPDATE limit_orders SET remaining = ?, status = ?, updated_at = ? WHERE id = ?",
+               (new_rem, new_status, now, order["id"]))
+    return {"order_id": order["id"], "user_id": uid, "action": action,
+            "shares": shares, "coins": coins, "fee": fee, "late": late}
+
+
+def process_limit_orders(db, market_id, max_steps=100):
+    """Fill any triggered open limit orders on `market_id` in price-time priority.
+    Must be called inside an open DB transaction. Returns list of fill dicts."""
+    m = db.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
+    if m is None or market_state(m) != "open":
+        return []
+    fills = []
+    skipped = {}  # order_id -> (balance_cents, held_centi, rounded_price)
+    for _ in range(max_steps):
+        outs = get_outcomes(db, market_id)
+        if not outs:
+            break
+        id_to_idx = {o["id"]: i for i, o in enumerate(outs)}
+        p_list = lmsr.prices([o["shares"] for o in outs], m["b"])
+        orders = db.execute(
+            "SELECT * FROM limit_orders WHERE market_id = ? AND status = 'open' ORDER BY id ASC",
+            (market_id,),
+        ).fetchall()
+        candidates = []
+        for o in orders:
+            idx = id_to_idx.get(o["outcome_id"])
+            if idx is None:
+                continue
+            p = p_list[idx]
+            lp = float(o["limit_price"])
+            if o["action"] == "buy" and p <= lp + 1e-12:
+                candidates.append((-(lp - p), o["id"], idx, o))
+            elif o["action"] == "sell" and p >= lp - 1e-12:
+                candidates.append((-(p - lp), o["id"], idx, o))
+        if not candidates:
+            break
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        filled_any = False
+        for _, oid, idx, order in candidates:
+            u_row = db.execute("SELECT balance FROM users WHERE id = ?", (order["user_id"],)).fetchone()
+            p_row = db.execute("SELECT shares FROM positions WHERE user_id = ? AND outcome_id = ?",
+                               (order["user_id"], order["outcome_id"])).fetchone()
+            state_key = (
+                lmsr.to_cents(u_row["balance"]) if u_row else 0,
+                lmsr.to_centi_shares(p_row["shares"]) if p_row else 0,
+                round(p_list[idx], 8),
+            )
+            if skipped.get(oid) == state_key:
+                continue
+            res = _try_fill_limit_order(db, m, outs, idx, order)
+            if res is not None:
+                fills.append(res)
+                skipped.pop(oid, None)
+                filled_any = True
+                break
+            skipped[oid] = state_key
+        if not filled_any:
+            break
+    if fills:
+        snapshot_prices(db, market_id, m["b"])
+    return fills
+
+
+def place_limit_order(db, user_id, market_id, outcome_id, action, value, limit_price):
+    """Create a standing limit order (buy or sell) and immediately process it if marketable."""
+    if action not in ("buy", "sell"):
+        raise TradeError("Unknown action.")
+    if not math.isfinite(limit_price) or limit_price < 0.01 - 1e-9 or limit_price > 0.99 + 1e-9:
+        raise TradeError("Limit price must be between 1% and 99%.")
+    limit_price = round(min(max(limit_price, 0.01), 0.99), 4)
+    if action == "buy":
+        amount = lmsr.from_cents(lmsr.to_cents(value))
+        if lmsr.to_cents(amount) < lmsr.to_cents(MIN_BET):
+            raise TradeError(f"Minimum bet is Ⓜ{MIN_BET:.0f}.")
+    else:
+        amount = lmsr.from_centi_shares(lmsr.to_centi_shares(value))
+        if lmsr.to_centi_shares(amount) <= 0:
+            raise TradeError("Enter a number of shares to sell.")
+
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        m = db.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
+        if m is None:
+            raise TradeError("Market not found.")
+        if market_state(m) != "open":
+            raise TradeError("This market is no longer accepting bets.")
+        block = trade_block_reason(db, user_id, market_id)
+        if block:
+            raise TradeError(block)
+        if action == "buy":
+            block = overdue_block(db, user_id)
+            if block:
+                raise TradeError(block)
+        outs = get_outcomes(db, market_id)
+        ids = [o["id"] for o in outs]
+        if outcome_id not in ids:
+            raise TradeError("Unknown outcome.")
+        label = outs[ids.index(outcome_id)]["label"]
+        now = now_str()
+        cur = db.execute(
+            "INSERT INTO limit_orders (user_id, market_id, outcome_id, action, limit_price, amount, remaining, "
+            "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)",
+            (user_id, market_id, outcome_id, action, limit_price, amount, amount, now, now),
+        )
+        oid = cur.lastrowid
+        fills = process_limit_orders(db, market_id)
+        order = db.execute("SELECT * FROM limit_orders WHERE id = ?", (oid,)).fetchone()
+        db.execute("COMMIT")
+
+        my_fills = [f for f in fills if f["order_id"] == oid]
+        filled_shares = sum(f["shares"] for f in my_fills)
+        filled_coins = sum(f["coins"] for f in my_fills)
+        pct_val = round(limit_price * 100, 1)
+        pct_str = f"{pct_val:.0f}%" if pct_val == int(pct_val) else f"{pct_val:.1f}%"
+        if order["status"] == "filled":
+            if action == "buy":
+                return (f"Limit buy filled immediately: paid Ⓜ{filled_coins:,.2f} for {filled_shares:,.2f} shares "
+                        f"of “{label}” (limit {pct_str}).")
+            return (f"Limit sell filled immediately: sold {filled_shares:,.2f} shares of “{label}” "
+                    f"for Ⓜ{filled_coins:,.2f} (limit {pct_str}).")
+        if my_fills:
+            if action == "buy":
+                return (f"Limit buy partially filled (Ⓜ{filled_coins:,.2f} for {filled_shares:,.2f} shares of “{label}”). "
+                        f"Remaining Ⓜ{order['remaining']:,.2f} stays open at {pct_str} or lower.")
+            return (f"Limit sell partially filled ({filled_shares:,.2f} shares of “{label}” for Ⓜ{filled_coins:,.2f}). "
+                    f"Remaining {order['remaining']:,.2f} shares stay open at {pct_str} or higher.")
+        if action == "buy":
+            return (f"Limit buy placed: Ⓜ{amount:,.2f} of “{label}” at {pct_str} or lower. "
+                    f"Your cash stays spendable until it triggers.")
+        return f"Limit sell placed: {amount:,.2f} shares of “{label}” at {pct_str} or higher."
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def cancel_limit_order(db, user_id, order_id):
+    """Cancel a single open limit order owned by user_id. Returns True if cancelled."""
+    now = now_str()
+    cur = db.execute(
+        "UPDATE limit_orders SET status = 'cancelled', updated_at = ? WHERE id = ? AND user_id = ? AND status = 'open'",
+        (now, order_id, user_id),
+    )
+    db.commit()
+    return cur.rowcount > 0
+
+
+def cancel_all_limit_orders(db, user_id):
+    """Cancel all open limit orders owned by user_id. Returns count cancelled."""
+    now = now_str()
+    cur = db.execute(
+        "UPDATE limit_orders SET status = 'cancelled', updated_at = ? WHERE user_id = ? AND status = 'open'",
+        (now, user_id),
+    )
+    db.commit()
+    return cur.rowcount
 
 
 def resolve_market(db, market_id, outcome_id, resolved_by=None, automatic=False):
@@ -1309,6 +1618,8 @@ def resolve_market(db, market_id, outcome_id, resolved_by=None, automatic=False)
                    (outcome_id, now_str(), resolved_by, cents(leftover_paid), market_id))
         db.execute("UPDATE disputes SET handled_at = ? WHERE market_id = ? AND handled_at IS NULL",
                    (now_str(), market_id))
+        db.execute("UPDATE limit_orders SET status = 'cancelled', updated_at = ? "
+                   "WHERE market_id = ? AND status = 'open'", (now_str(), market_id))
         db.execute("COMMIT")
         return len(winners)
     except Exception:
@@ -1404,6 +1715,8 @@ def cancel_market(db, market_id):
                    (now_str(), market_id))
         db.execute("UPDATE markets SET status = 'cancelled', resolved_at = ?, proposed_outcome_id = NULL, "
                    "proposed_by = NULL, proposed_at = NULL, finalizes_at = NULL WHERE id = ?", (now_str(), market_id))
+        db.execute("UPDATE limit_orders SET status = 'cancelled', updated_at = ? "
+                   "WHERE market_id = ? AND status = 'open'", (now_str(), market_id))
         db.execute("COMMIT")
     except Exception:
         db.execute("ROLLBACK")
@@ -1429,8 +1742,8 @@ def delete_market(db, market_id):
         db.execute("DELETE FROM positions WHERE outcome_id IN (SELECT id FROM outcomes WHERE market_id = ?)",
                    (market_id,))
         db.execute("UPDATE proposals SET market_id = NULL WHERE market_id = ?", (market_id,))
-        for table in ("trades", "price_history", "comments", "market_blocks", "market_entries", "disputes",
-                      "clarifications", "outcomes"):
+        for table in ("limit_orders", "trades", "price_history", "comments", "market_blocks", "market_entries",
+                      "disputes", "clarifications", "outcomes"):
             db.execute(f"DELETE FROM {table} WHERE market_id = ?", (market_id,))
         db.execute("DELETE FROM markets WHERE id = ?", (market_id,))
         db.execute("COMMIT")
@@ -2338,11 +2651,11 @@ def send_email_code(db, user_id, username, email):
     return True
 
 
+@app.route("/profile", methods=["GET", "POST"])
 @app.route("/account/email", methods=["GET", "POST"])
 @login_required
 def account_email():
-    """Add (or change) your email: enter it, then type the code we send to it. Accounts without a confirmed email
-    are sent here before they can use the rest of the site."""
+    """Profile settings (and email confirmation gate for accounts without a confirmed email)."""
     db = get_db()
     u = g.user
     challenge = db.execute("SELECT * FROM login_challenges WHERE username = ?", (u["username"],)).fetchone()
@@ -2412,6 +2725,53 @@ def account_email():
                            current=u["email"] if u["email_verified"] else None)
 
 
+@app.post("/account/username")
+@login_required
+def change_username():
+    new_name = request.form.get("username", "").strip()
+    old_name = g.user["username"]
+    if rate_limited(("change-username", g.user["id"]), 10, 3600):
+        flash("You're changing your name too often. Try again later.", "error")
+    elif not USERNAME_RE.match(new_name):
+        flash("Name must be 3–20 characters: letters, numbers, _, - or .", "error")
+    elif new_name == old_name:
+        flash("That's already your name.", "info")
+    elif OWNER_USERNAME and (
+        (old_name.lower() == OWNER_USERNAME.lower() and new_name.lower() != OWNER_USERNAME.lower())
+        or (old_name.lower() != OWNER_USERNAME.lower() and new_name.lower() == OWNER_USERNAME.lower())
+    ):
+        flash("That username is reserved for the site owner.", "error")
+    else:
+        db = get_db()
+        taken = db.execute(
+            "SELECT id FROM users WHERE username = ? COLLATE NOCASE AND id != ?",
+            (new_name, g.user["id"]),
+        ).fetchone()
+        if taken:
+            flash("That name is already taken.", "error")
+        else:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute("UPDATE users SET username = ? WHERE id = ?", (new_name, g.user["id"]))
+                db.execute("UPDATE sightings SET username = ? WHERE user_id = ?", (new_name, g.user["id"]))
+                db.execute("DELETE FROM login_challenges WHERE username = ? COLLATE NOCASE", (old_name,))
+                db.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                db.execute("ROLLBACK")
+                flash("That name is already taken.", "error")
+                return redirect(url_for("account_email"))
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
+            try:
+                write_email_csv(db)
+            except OSError:
+                current_app.logger.exception("Couldn't update people.csv.")
+            log_event("username_changed", detail=f"{old_name} -> {new_name}")
+            flash(f"Your name is now {new_name}.", "success")
+    return redirect(url_for("account_email"))
+
+
 def set_temporary_password(db, user_id):
     """Give a user a new random password, sign them out everywhere and clear their login lockout.
     Returns the password (shown once to whoever reset it)."""
@@ -2447,6 +2807,9 @@ def change_password():
         session["gen"] = g.user["session_gen"] + 1  # keep this device signed in; every other one is signed out
         log_event("password_changed", detail="other devices were signed out")
         flash("Password changed.", "success")
+    nxt = (request.form.get("next") or "").strip()
+    if nxt.startswith("/") and not nxt.startswith("//"):
+        return redirect(nxt)
     return redirect(url_for("portfolio") + "#account")
 
 
@@ -2594,6 +2957,16 @@ def market(mid):
                 if p["outcome"]["id"] == b["m"]["resolved_outcome_id"]:
                     p["bonus"] = bonus
                     p["value"] += bonus
+    my_limit_orders = []
+    if g.user:
+        by_id = {o["id"]: o for o in b["outcomes"]}
+        for lo in db.execute(
+            "SELECT * FROM limit_orders WHERE user_id = ? AND market_id = ? AND status = 'open' ORDER BY id DESC",
+            (g.user["id"], mid),
+        ).fetchall():
+            o = by_id.get(lo["outcome_id"])
+            if o:
+                my_limit_orders.append({**dict(lo), "label": o["label"], "current_price": o["price"]})
     block_reason = trade_block_reason(db, g.user["id"], mid) if g.user else None
     blocked, all_users = [], []
     if g.user and g.user["is_admin"]:
@@ -2605,7 +2978,7 @@ def market(mid):
     pick = request.args.get("pick", type=int)
     return render_template("market.html", b=b, history=history, trades=trades, comments=comments,
                            trend=trend, pick=pick if pick in {o["id"] for o in b["outcomes"]} else None,
-                           my_positions=my_positions, block_reason=block_reason,
+                           my_positions=my_positions, my_limit_orders=my_limit_orders, block_reason=block_reason,
                            creator=creator, my_entry_fee=my_entry_fee,
                            late_t=late_multiplier(m) if b["state"] == "open" else 0.0,
                            blocked=blocked, all_users=all_users, clarifications=clarifications,
@@ -2687,19 +3060,31 @@ def trade(mid):
     try:
         db = get_db()
         action = request.form.get("action")
+        order_type = (request.form.get("order_type") or "market").strip().lower()
         mkt = db.execute("SELECT * FROM markets WHERE id = ?", (mid,)).fetchone()
         fee_due = bool(mkt) and entry_fee_due(db, mkt, g.user["id"]) > 0
-        flash(execute_trade(db, g.user["id"], mid, outcome_id, action, value, min_out), "success")
-        if fee_due:  # paid an entry fee to the market's creator: money moving between linked accounts is a signal
-            rescore(db, g.user["id"], mkt["created_by"])
-        # the next page plays a short animation: confetti in the outcome's colour, the balance ticking over
-        m = db.execute("SELECT ou_line FROM markets WHERE id = ?", (mid,)).fetchone()
-        labels = [o["label"] for o in get_outcomes(db, mid)]
-        ids = [o["id"] for o in get_outcomes(db, mid)]
-        idx = ids.index(outcome_id) if outcome_id in ids else 0
-        binary = is_binary(labels) or (m is not None and m["ou_line"] is not None)
-        session["celebrate"] = {"kind": "buy" if action == "buy" else "sell", "from": g.user["balance"],
-                                "color": ("--yes" if idx == 0 else "--no") if binary else f"--c{idx}"}
+        if order_type == "limit":
+            try:
+                limit_pct = float(request.form.get("limit_pct", ""))
+                if not math.isfinite(limit_pct):
+                    raise ValueError
+            except ValueError:
+                raise TradeError("Enter a valid limit percentage between 1% and 99%.")
+            flash(place_limit_order(db, g.user["id"], mid, outcome_id, action, value, limit_pct / 100.0), "success")
+            if fee_due and entry_fee_due(db, mkt, g.user["id"]) == 0:
+                rescore(db, g.user["id"], mkt["created_by"])
+        else:
+            flash(execute_trade(db, g.user["id"], mid, outcome_id, action, value, min_out), "success")
+            if fee_due:  # paid an entry fee to the market's creator: money moving between linked accounts is a signal
+                rescore(db, g.user["id"], mkt["created_by"])
+            # the next page plays a short animation: confetti in the outcome's colour, the balance ticking over
+            m = db.execute("SELECT ou_line FROM markets WHERE id = ?", (mid,)).fetchone()
+            labels = [o["label"] for o in get_outcomes(db, mid)]
+            ids = [o["id"] for o in get_outcomes(db, mid)]
+            idx = ids.index(outcome_id) if outcome_id in ids else 0
+            binary = is_binary(labels) or (m is not None and m["ou_line"] is not None)
+            session["celebrate"] = {"kind": "buy" if action == "buy" else "sell", "from": g.user["balance"],
+                                    "color": ("--yes" if idx == 0 else "--no") if binary else f"--c{idx}"}
     except TradeError as e:
         flash(str(e), "error")
     return redirect(url_for("market", mid=mid))
@@ -2821,8 +3206,51 @@ def portfolio():
         "COALESCE(SUM(CASE WHEN status = 'active' AND lender_id = ? THEN owed END), 0) AS owed, "
         "COALESCE(SUM(CASE WHEN status = 'offered' AND lender_id = ? THEN principal END), 0) AS held "
         "FROM loans", (uid, uid, uid)).fetchone()
+    lo_rows = db.execute(
+        "SELECT lo.*, o.label, m.question FROM limit_orders lo "
+        "JOIN outcomes o ON o.id = lo.outcome_id JOIN markets m ON m.id = lo.market_id "
+        "WHERE lo.user_id = ? AND lo.status = 'open' ORDER BY lo.id DESC", (uid,)).fetchall()
+    limit_orders = []
+    for lo in lo_rows:
+        if lo["market_id"] not in bundles:
+            m = db.execute("SELECT * FROM markets WHERE id = ?", (lo["market_id"],)).fetchone()
+            bundles[lo["market_id"]] = bundle(db, m)
+        b = bundles[lo["market_id"]]
+        o = next((x for x in b["outcomes"] if x["id"] == lo["outcome_id"]), None)
+        limit_orders.append({
+            **dict(lo),
+            "current_price": o["price"] if o else 0.0,
+            "state": b["state"],
+        })
     return render_template("portfolio.html", active=active, settled=settled, trades=trades, worth=worth,
-                           invested=invested, rows_total=sum(i["value"] for i in active), loan_totals=loan_totals)
+                           invested=invested, rows_total=sum(i["value"] for i in active),
+                           loan_totals=loan_totals, limit_orders=limit_orders)
+
+
+@app.post("/limit-orders/<int:oid>/cancel")
+@login_required
+def cancel_limit_order_route(oid):
+    db = get_db()
+    if cancel_limit_order(db, g.user["id"], oid):
+        flash("Limit order cancelled.", "success")
+    else:
+        flash("Limit order not found or already closed.", "error")
+    nxt = (request.form.get("next") or "").strip()
+    if nxt.startswith("/") and not nxt.startswith("//"):
+        return redirect(nxt)
+    return redirect(url_for("portfolio"))
+
+
+@app.post("/limit-orders/cancel-all")
+@login_required
+def cancel_all_limit_orders_route():
+    db = get_db()
+    n = cancel_all_limit_orders(db, g.user["id"])
+    if n:
+        flash(f"Cancelled {n} open limit order{'s' if n != 1 else ''}.", "success")
+    else:
+        flash("You have no open limit orders to cancel.", "info")
+    return redirect(url_for("portfolio"))
 
 
 ACTIVITY_FILTERS = {
@@ -3460,6 +3888,7 @@ def seize_position(db, loan_id, lender_id, outcome_id, mode):
             db.execute("INSERT INTO trades (user_id, market_id, outcome_id, shares, amount, created_at) "
                        "VALUES (?, ?, ?, ?, ?, ?)", (borrower_id, m["id"], outcome_id, -n, -coins, now_str()))
             snapshot_prices(db, m["id"], m["b"])
+            process_limit_orders(db, m["id"])
             paid = pay_loan(db, loan, min(coins, loan["owed"]), automatic=True)
             msg = f"Sold {n:,.2f} shares of “{label}” for Ⓜ{coins:,.2f}. Ⓜ{paid:,.2f} went to your loan."
         else:
@@ -4632,7 +5061,7 @@ def delete_account(db, user_id):
         for r in db.execute("SELECT DISTINCT market_id FROM trades WHERE user_id = ? ORDER BY market_id",
                             (user_id,)).fetchall():
             reversed_total += refund_user_in_market(db, user_id, r["market_id"], "Refund (account deleted)")
-        for table in ("positions", "trades", "comments", "disputes", "market_blocks", "market_entries",
+        for table in ("limit_orders", "positions", "trades", "comments", "disputes", "market_blocks", "market_entries",
                       "activity", "comment_mutes", "trade_bans", "proposals"):
             db.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
         db.execute("DELETE FROM market_entries WHERE creator_id = ?", (user_id,))
