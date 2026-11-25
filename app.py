@@ -701,7 +701,7 @@ def parse_ou(f):
 
 STOCK_CATEGORY = "Stocks"
 TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-=^]{0,14}$")
-STOCK_CHECK_EVERY = 300  # seconds between looks for stock markets that are ready to settle
+STOCK_CHECK_EVERY = 60  # seconds between looks for stock markets that are ready to settle
 STOCK_PRICE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?{query}"
 _stock_lock = threading.Lock()
 _stock_last_check = 0.0
