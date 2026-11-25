@@ -1722,3 +1722,75 @@ def test_bundle_many_matches_bundle():
             assert b_item["outcomes"] == s_item["outcomes"]
     finally:
         appmod.DB_PATH = old
+
+
+def test_admin_can_cancel_and_refund_one_purchase():
+    path = os.path.join(tempfile.mkdtemp(), "cancel-trade.db")
+    old = appmod.DB_PATH
+    appmod.DB_PATH = path
+    appmod._hits.clear()
+    try:
+        appmod.init_db()
+        db = appmod.connect()
+        admin, gus, hal = (appmod.app.test_client() for _ in range(3))
+        signup(admin, "boss")
+        signup(gus, "gus")
+        signup(hal, "hal")
+        uid = lambda n: db.execute("SELECT id FROM users WHERE username=?", (n,)).fetchone()[0]
+        bal = lambda n: db.execute("SELECT balance FROM users WHERE username=?", (n,)).fetchone()[0]
+        closes = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+        mid = appmod.create_market(db, "Cancel one?", "", "Other", closes, ["Yes", "No"], 100,
+                                   created_by=uid("boss"))
+        yes, no = (o["id"] for o in appmod.get_outcomes(db, mid))
+
+        appmod.execute_trade(db, uid("gus"), mid, yes, "buy", 50)   # + Ⓜ10 entry fee
+        appmod.execute_trade(db, uid("gus"), mid, yes, "buy", 30)
+        appmod.execute_trade(db, uid("hal"), mid, no, "buy", 40)
+        first, second = [r[0] for r in db.execute(
+            "SELECT id FROM trades WHERE user_id=? ORDER BY id", (uid("gus"),))]
+        second_shares = db.execute("SELECT shares FROM trades WHERE id=?", (second,)).fetchone()[0]
+        held = db.execute("SELECT shares FROM positions WHERE user_id=? AND outcome_id=?",
+                          (uid("gus"), yes)).fetchone()[0]
+        q_yes = db.execute("SELECT shares FROM outcomes WHERE id=?", (yes,)).fetchone()[0]
+        before = bal("gus")
+
+        # regular users can't
+        page = admin.get(f"/market/{mid}")
+        assert f"/admin/trades/{second}/cancel" in page.get_data(as_text=True)
+        assert f"/admin/trades/{second}/cancel" not in gus.get(f"/market/{mid}").get_data(as_text=True)
+        tok = csrf(gus.get(f"/market/{mid}"))
+        assert gus.post(f"/admin/trades/{second}/cancel", data={"csrf_token": tok}).status_code == 403
+
+        # the admin cancels the second purchase: Ⓜ30 back, shares out of the position and the market
+        tok = csrf(page)
+        r = admin.post(f"/admin/trades/{second}/cancel", data={"csrf_token": tok}, follow_redirects=True)
+        assert "refunded Ⓜ30.00" in r.get_data(as_text=True)
+        assert bal("gus") == pytest.approx(before + 30)
+        assert db.execute("SELECT 1 FROM trades WHERE id=?", (second,)).fetchone() is None
+        assert db.execute("SELECT shares FROM positions WHERE user_id=? AND outcome_id=?",
+                          (uid("gus"), yes)).fetchone()[0] == pytest.approx(held - second_shares)
+        assert db.execute("SELECT shares FROM outcomes WHERE id=?", (yes,)).fetchone()[0] == pytest.approx(
+            q_yes - second_shares)
+        assert db.execute("SELECT 1 FROM audit_log WHERE action='market.cancel_trade'").fetchone()
+        assert bal("hal") == pytest.approx(1000 - 40 - appmod.ENTRY_FEE)  # other traders untouched
+
+        # once his last purchase is gone, his entry fee comes back too
+        admin.post(f"/admin/trades/{first}/cancel", data={"csrf_token": tok})
+        assert bal("gus") == pytest.approx(1000)
+        assert db.execute("SELECT COUNT(*) FROM positions WHERE user_id=?", (uid("gus"),)).fetchone()[0] == 0
+
+        # can't cancel a purchase whose shares have since been sold
+        appmod.execute_trade(db, uid("hal"), mid, no, "sell", 5)
+        hal_buy = db.execute("SELECT id FROM trades WHERE user_id=? AND shares > 0", (uid("hal"),)).fetchone()[0]
+        with pytest.raises(appmod.TradeError, match="sold"):
+            appmod.cancel_trade(db, hal_buy)
+        hal_sell = db.execute("SELECT id FROM trades WHERE user_id=? AND shares < 0", (uid("hal"),)).fetchone()[0]
+        with pytest.raises(appmod.TradeError, match="purchases"):
+            appmod.cancel_trade(db, hal_sell)
+
+        # nor in a settled market
+        appmod.cancel_market(db, mid)
+        with pytest.raises(appmod.TradeError, match="unresolved"):
+            appmod.cancel_trade(db, hal_buy)
+    finally:
+        appmod.DB_PATH = old

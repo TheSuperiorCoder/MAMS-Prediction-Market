@@ -977,6 +977,48 @@ def refund_user_in_market(db, user_id, market_id, reason="Refund"):
     return refund
 
 
+def cancel_trade(db, trade_id, reason="Refund"):
+    """Undo one share purchase in an unresolved market: give the buyer back what they paid for it, take those
+    shares out of their position and out of the market (reversing its effect on prices) and erase the trade.
+    If it was their last trade here, their entry fee is returned too. Late-trading fees are not refunded.
+    Raises TradeError when the purchase can't be undone. Returns (refund, trade row)."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        t = db.execute("SELECT t.*, o.label FROM trades t JOIN outcomes o ON o.id = t.outcome_id "
+                       "WHERE t.id = ?", (trade_id,)).fetchone()
+        if t is None:
+            raise TradeError("That trade no longer exists.")
+        m = db.execute("SELECT * FROM markets WHERE id = ?", (t["market_id"],)).fetchone()
+        if m is None or m["status"] != "open":
+            raise TradeError("Only trades in unresolved markets can be cancelled.")
+        if t["shares"] <= 0 or t["via"]:
+            raise TradeError("Only share purchases can be cancelled.")
+        pos = db.execute("SELECT * FROM positions WHERE user_id = ? AND outcome_id = ?",
+                         (t["user_id"], t["outcome_id"])).fetchone()
+        held = pos["shares"] if pos else 0.0
+        if held < t["shares"] - 1e-6:
+            raise TradeError(f"They've since sold some of these shares (they hold {held:,.2f} of "
+                             f"{t['shares']:,.2f}). Refund all their bets in this market instead.")
+        shares = min(t["shares"], held)
+        refund = cents(max(t["amount"], 0.0))
+        set_position(db, t["user_id"], t["outcome_id"], held - shares, max(pos["cost"] - refund, 0.0))
+        db.execute("UPDATE outcomes SET shares = shares - ? WHERE id = ?", (shares, t["outcome_id"]))
+        db.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
+        if refund > 0:
+            db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (refund, t["user_id"]))
+        log_activity(db, t["user_id"], "refund", refund, m,
+                     f"{reason}: your purchase of {shares:,.2f} shares of “{t['label']}” was cancelled")
+        if not db.execute("SELECT 1 FROM trades WHERE user_id = ? AND market_id = ? LIMIT 1",
+                          (t["user_id"], m["id"])).fetchone():
+            refund_entry_fees(db, m["id"], t["user_id"], f"{reason}: entry fee returned")
+        snapshot_prices(db, m["id"], m["b"])
+        db.execute("COMMIT")
+        return refund, t
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
 def block_user_in_market(db, user_id, market_id):
     db.execute("BEGIN IMMEDIATE")
     try:
@@ -1735,6 +1777,7 @@ AUDIT_ACTIONS = {
     "market.convert_ou": "Converted a market to Over/Under",
     "market.block": "Blocked a user from a market",
     "market.unblock": "Unblocked a user from a market",
+    "market.cancel_trade": "Cancelled and refunded a share purchase",
     "result.propose": "Proposed a result",
     "result.retract": "Withdrew a proposed result",
     "result.confirm": "Confirmed a disputed result",
@@ -4389,6 +4432,31 @@ def admin_block(mid):
         flash(f"{u['username']} can no longer bet on this market."
               + (f" Refunded Ⓜ{refund:,.2f} and removed their bets." if refund else ""), "success")
     return redirect(url_for("market", mid=mid) + "#admin")
+
+
+@app.post("/admin/trades/<int:tid>/cancel")
+@admin_required
+def admin_cancel_trade(tid):
+    db = get_db()
+    t = db.execute("SELECT t.user_id, t.market_id, u.username FROM trades t JOIN users u ON u.id = t.user_id "
+                   "WHERE t.id = ?", (tid,)).fetchone()
+    if t is None:
+        flash("That trade no longer exists.", "error")
+        return back(url_for("admin"))
+    mid = t["market_id"]
+    if t["user_id"] != g.user["id"] and not can_manage(t["user_id"]):
+        flash(NOT_ALLOWED, "error")
+        return redirect(url_for("market", mid=mid) + "#trades")
+    try:
+        refund, row = cancel_trade(db, tid, "Refund (purchase cancelled by an admin)")
+    except TradeError as e:
+        flash(str(e), "error")
+        return redirect(url_for("market", mid=mid) + "#trades")
+    log_audit("market.cancel_trade", "user", t["user_id"], t["username"],
+              f"Market #{mid}, trade #{tid}: {row['shares']:,.2f} × {row['label']}. Refunded Ⓜ{refund:,.2f}.")
+    flash(f"Cancelled {t['username']}'s purchase of {row['shares']:,.2f} × {row['label']} "
+          f"and refunded Ⓜ{refund:,.2f}.", "success")
+    return redirect(url_for("market", mid=mid) + "#trades")
 
 
 @app.post("/admin/markets/<int:mid>/unblock/<int:uid>")

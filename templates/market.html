@@ -134,7 +134,7 @@
     </div>
     {% endif %}
 
-    <div class="card">
+    <div class="card" id="trades">
       <div class="card-head"><h2>Recent trades</h2>{% if trades %}<a class="small" href="{{ url_for('activity', market=b.m.id) }}">All →</a>{% endif %}</div>
       {% if trades %}
       <ul class="trade-list">
@@ -147,7 +147,15 @@
               {% if t.via == 'loan' %}{% if t.shares > 0 %}<span class="buy">took over</span>{% else %}<span class="sell">handed over</span>{% endif %}
               {% elif t.shares > 0 %}<span class="buy">bought</span>{% else %}<span class="sell">sold</span>{% endif %}
               {{ t.shares|abs|money }} × {{ t.label }} <span class="trade-when">· {% if t.via == 'loan' %}overdue loan · {% endif %}{{ t.created_at|ago }}</span></span>
-            <span class="trade-amt">Ⓜ{{ t.amount|abs|money }}</span>
+            <span class="trade-amt">Ⓜ{{ t.amount|abs|money }}
+              {% if user and user.is_admin and b.m.status == 'open' and t.shares > 0 and not t.via %}
+              <form method="post" action="{{ url_for('admin_cancel_trade', tid=t.id) }}" class="inline"
+                    data-confirm="{{ t.username }} gets back the Ⓜ{{ t.amount|money }} they paid, and the {{ t.shares|money }} shares of “{{ t.label }}” are removed from the market."
+                    data-confirm-title="Cancel this purchase?" data-confirm-label="Cancel &amp; refund">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button class="btn btn-small btn-ghost" title="Admin: cancel this purchase and refund it">Cancel</button>
+              </form>
+              {% endif %}</span>
           </li>
         {% endfor %}
       </ul>
