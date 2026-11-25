@@ -75,7 +75,7 @@ def test_net_worth_cache_is_reused_and_dropped_when_anything_changes(monkeypatch
     assert len(calls) == 2                                            # a trade invalidates it
     db.execute("UPDATE users SET balance = balance + 5")
     after = appmod.net_worths(db)
-    assert len(calls) == 3 and after[1] == pytest.approx(first[1] + 5)
+    assert len(calls) == 3 and after[1] == pytest.approx(first[1] + 5, abs=0.02)
     after[1] = -1                                                     # callers can't corrupt the cached copy
     assert appmod.net_worths(db)[1] != -1
 

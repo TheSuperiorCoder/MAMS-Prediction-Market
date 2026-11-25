@@ -110,8 +110,7 @@
             <td data-label="Outcome"><strong>{{ p.outcome.label }}</strong>{% if p.outcome.id == b.m.resolved_outcome_id %} <span class="up">✓</span>{% endif %}</td>
             <td class="num" data-label="Shares">{{ p.shares|money }}</td>
             <td class="num" data-label="Spent">Ⓜ{{ p.cost|money }}</td>
-            <td class="num" data-label="Paid out">Ⓜ{{ p.value|money }}
-              {% if p.bonus %}<div class="muted small">Ⓜ{{ (p.value - p.bonus)|money }} + Ⓜ{{ p.bonus|money }} pot bonus</div>{% endif %}</td>
+            <td class="num" data-label="Paid out">Ⓜ{{ p.value|money }}</td>
             <td class="num {{ 'up' if profit >= 0 else 'down' }}" data-label="Profit"><b>{{ '+' if profit >= 0 else '−' }}Ⓜ{{ profit|abs|money }}</b></td>
           </tr>
         {% endfor %}
@@ -125,8 +124,7 @@
             <td class="num" data-label="Shares">{{ p.shares|money }}</td>
             <td class="num" data-label="Spent">Ⓜ{{ p.cost|money }}</td>
             <td class="num {{ 'up' if p.value >= p.cost else 'down' }}" data-label="Sell value">Ⓜ{{ p.value|money }}</td>
-            <td class="num" data-label="Pays if right"><b>Ⓜ{{ p.shares|money }}</b>
-              {% if p.est_bonus %}<div class="muted small" title="Your share of what would be left in the pot if this outcome won right now. It changes as people trade.">+ ~Ⓜ{{ p.est_bonus|money }} bonus if it ended now</div>{% endif %}</td>
+            <td class="num" data-label="Pays if right"><b>Ⓜ{{ p.shares|money }}</b></td>
           </tr>
         {% endfor %}
         </tbody>
@@ -203,15 +201,11 @@
       <h2>Place a bet</h2>
       {% if late_t %}
         <p class="late-note"><b>Late trading fee is on (×{{ late_t|round(1)|string|replace('.0', '') }}).</b>
-          Only {{ b.m.closes_at|until }} before betting closes, so buying or selling now costs extra. The closer to the
-          deadline, the bigger the fee{% if creator and not (user and user.username == creator) %}, which goes to {{ creator }}{% endif %}.
+          Only {{ b.m.closes_at|until }} before betting closes, so buying or selling now costs extra (paid to the house).
           <a href="{{ url_for('how_it_works') }}#late-fee">Why?</a></p>
       {% endif %}
       {% if creator %}
-        <p class="fee-note">Market by <b>{{ creator }}</b>.
-          {% if my_entry_fee %}Your first bet here includes a <b>Ⓜ{{ my_entry_fee|int }} entry fee</b> that goes to {{ creator }}.
-          {% elif user and user.username == creator %}This is your market: you earn Ⓜ{{ ENTRY_FEE|int }} from each new trader.
-          {% elif user %}You've already paid the entry fee here.{% endif %}</p>
+        <p class="fee-note">Market by <b>{{ creator }}</b>.</p>
       {% endif %}
       {% if user and block_reason %}
         <p class="muted">{{ block_reason }}</p>
@@ -264,7 +258,7 @@
       <h2>Result</h2>
       {% for o in b.outcomes if o.id == b.m.resolved_outcome_id %}<p class="result">{{ o.label }}</p>{% endfor %}
       <p class="muted small">Every “{% for o in b.outcomes if o.id == b.m.resolved_outcome_id %}{{ o.label }}{% endfor %}” share paid Ⓜ1.
-        {% if b.m.leftover_paid %}The Ⓜ{{ b.m.leftover_paid|money }} left in the pot was shared among the winners by shares held.{% endif %}
+        {% if b.m.leftover_paid %}Ⓜ{{ b.m.leftover_paid|money }} from the leftover pot went to the market creator.{% endif %}
         {% if b.m.proposed_at %}Proposed {{ b.m.proposed_at|when }} · finalized {{ b.m.resolved_at|when }}.{% endif %}</p>
     </div>
     {% elif b.state == 'closed' %}

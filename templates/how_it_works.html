@@ -40,27 +40,21 @@
 
   <h2>Making markets (and earning from them)</h2>
   <ul>
-    <li>Proposing a market costs <b>Ⓜ{{ CREATION_FEE|int }}</b>. You get it back if you withdraw the proposal, but not
-      if an admin rejects it, so only propose questions people will want to bet on.</li>
-    <li>You also have to <b>bet at least Ⓜ{{ CREATOR_MIN_BET|int }}</b> on your own market when you propose it. It's
-      held until an admin approves the market, then placed as a normal bet. If the proposal is rejected or withdrawn,
-      it comes back.</li>
-    <li>Once your market is live, every trader pays you <b>Ⓜ{{ ENTRY_FEE|int }}</b> on their first bet in it.
-      Ten traders earn you Ⓜ{{ (ENTRY_FEE * 10)|int }}.</li>
-    <li>If a market is cancelled or deleted, entry fees go back to the traders.</li>
+    <li>Proposing a market is free, though you must <b>bet at least Ⓜ{{ CREATOR_MIN_BET|int }}</b> on your own market
+      when you propose it. It's held until an admin approves the market, then placed as a normal bet. If the proposal
+      is rejected or withdrawn, it comes back.</li>
+    <li>There are no per-trader entry fees. Instead, when the market resolves, any money left over in the pot after
+      paying Ⓜ1 per winning share goes to the market creator (capped at Ⓜ1,000).</li>
   </ul>
 
   <h2>Where winnings come from</h2>
   <p>Every bet goes into the market's pot. When the market resolves, each winning share is paid Ⓜ1 from the pot, so
-    the losers' money pays the winners. If there's money left over, it's shared among the winners in proportion to
-    how many winning shares they hold. If the pot comes up short, the site covers the difference.</p>
-  <p class="muted small">Shares you hold on <i>every</i> outcome at once don't count towards the bonus. A full set (say one
-    Yes and one No) always costs exactly Ⓜ1 and always pays exactly Ⓜ1, so it carries no risk.</p>
+    the losers' money pays the winners. If there's money left over, up to Ⓜ1,000 goes to the market creator. If the pot
+    comes up short, the site covers the difference.</p>
 
   <h2 id="late-fee">Late trading fee</h2>
   <p>Trading right before betting closes, when the answer may already be obvious, costs a fee. It's charged on buys
-    and sells and paid to the person who made the market (on markets without a maker, or when makers trade their
-    own market late, it isn't paid to anyone):</p>
+    and sells and paid to the house:</p>
   <p class="formula">fee = {{ '%g'|format(LATE_FEE_RATE) }} × shares traded × P × (1 − P) × T</p>
   <p class="muted small">P is the average price per share in your trade (so 55¢ means P = 0.55). P × (1 − P) is largest at
     50¢ and small near 0¢ or 100¢.</p>

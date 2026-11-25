@@ -22,13 +22,11 @@
       </div>
       {% include "_creator_stake.html" %}
       <div class="fee-box">
-        <strong>Costs Ⓜ{{ CREATION_FEE|int }} to propose, plus your opening bet.</strong> Both are held now. If an admin
-        approves, your opening bet is placed in the new market. If they reject it, your bet comes back but the
-        Ⓜ{{ CREATION_FEE|int }} fee is kept. Withdraw it yourself and you get both back.
-        Once your market is live, <b>every trader pays you Ⓜ{{ ENTRY_FEE|int }}</b> on their first bet, so a market lots of
-        people want to bet on earns you money.
+        <strong>No proposal fee — just your opening bet.</strong> Your opening bet is held until an admin reviews the
+        market. If they approve, it's placed in the new market. If they reject or you withdraw it, your bet comes back.
+        When the market resolves, any leftover pot (up to Ⓜ1,000) goes to you as the creator.
       </div>
-      <button class="btn">Send for approval · Ⓜ{{ CREATION_FEE|int }} fee + opening bet</button>
+      <button class="btn">Send for approval</button>
     </form>
   </div>
 

@@ -176,7 +176,14 @@ def compute_credit(db, uid, cfg, now=None, bets=0.0, risk=None, adjust=0, grace_
     loans = db.execute("SELECT * FROM loans WHERE borrower_id = ? AND accepted_at IS NOT NULL "
                        "AND status IN ('active', 'repaid', 'forgiven')", (uid,)).fetchall()
     grace = cfg["grace_days"]
-    start_ts = (_dt(grace_start) or datetime.fromtimestamp(0)).timestamp() if grace_start else 0.0
+    start_dt = _dt(grace_start) if grace_start else None
+    if start_dt is None or start_dt.year <= 1970:
+        start_ts = 0.0
+    else:
+        try:
+            start_ts = start_dt.timestamp()
+        except (OSError, OverflowError, ValueError):
+            start_ts = 0.0
 
     def grace_end(loan):
         due_ts = (_dt(loan["due_at"]) or now).timestamp()

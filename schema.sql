@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS markets (
     proposed_at         TEXT,
     finalizes_at        TEXT,
     resolved_by         INTEGER,
-    featured            INTEGER NOT NULL DEFAULT 0   -- admins can pin a market to the top of the home page
+    featured            INTEGER NOT NULL DEFAULT 0,   -- admins can pin a market to the top of the home page
+    pot_cents           INTEGER NOT NULL DEFAULT 0    -- net trader cash in the market pool (integer cents)
 );
 
 CREATE TABLE IF NOT EXISTS outcomes (

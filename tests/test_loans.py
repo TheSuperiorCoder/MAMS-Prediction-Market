@@ -370,7 +370,7 @@ def test_take_over_moves_shares_and_reduces_the_debt():
     assert "took over" in html and "handed over" in html
 
 
-def test_take_over_pays_the_entry_fee_and_survives_a_cancelled_market():
+def test_take_over_survives_a_cancelled_market():
     db = _fresh_db()
     creator = _user(db, "maker")
     closes = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
@@ -379,12 +379,13 @@ def test_take_over_pays_the_entry_fee_and_survives_a_cancelled_market():
     ann, bob, lid, mid, yes = borrower_with_bet(db, 300, market=(mid, [yes, 0]))
     cash, maker = bal(db, ann), bal(db, creator)
     appmod.seize_position(db, lid, ann, yes, "take")
-    assert bal(db, ann) == pytest.approx(cash - appmod.ENTRY_FEE) and bal(db, creator) == pytest.approx(maker + appmod.ENTRY_FEE)
-    assert db.execute("SELECT 1 FROM market_entries WHERE market_id = ? AND user_id = ?", (mid, ann)).fetchone()
+    assert bal(db, ann) == pytest.approx(cash) and bal(db, creator) == pytest.approx(maker)
     appmod.cancel_market(db, mid)
-    # ann gets back what the shares counted for (the debt she wrote off) and her entry fee; bob gets back the rest
-    assert bal(db, ann) == pytest.approx(cash + 100, abs=0.5)
-    assert bal(db, bob) == pytest.approx(300 - 100 + appmod.ENTRY_FEE, abs=0.5)
+    # Radial LMSR unwinding prices all shares of Yes at the same average ray value,
+    # conserving the 300-coin pool across ann's seized shares and bob's remainder.
+    assert bal(db, ann) == pytest.approx(cash + 85.93, abs=0.05)
+    assert bal(db, bob) == pytest.approx(214.07, abs=0.05)
+    assert (bal(db, ann) - cash) + bal(db, bob) == pytest.approx(300.0, abs=0.05)
 
 
 def test_take_over_is_refused_when_late_blocked_or_unaffordable_but_force_sell_works():
@@ -562,17 +563,16 @@ def test_resolving_after_a_take_over_pays_the_same_total_split_by_shares():
     assert paid_ann / paid_bob == pytest.approx(n / (held - n), rel=0.02)                 # leftover follows the shares
 
 
-def test_take_over_needs_cash_for_the_entry_fee():
+def test_take_over_requires_no_entry_fee():
     db = _fresh_db()
     creator = _user(db, "maker")
     closes = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
-    mid = appmod.create_market(db, "Fee?", "", "Other", closes, ["a", "b"], 300, created_by=creator)
+    mid = appmod.create_market(db, "No fee?", "", "Other", closes, ["a", "b"], 300, created_by=creator)
     yes = appmod.get_outcomes(db, mid)[0]["id"]
     ann, bob, lid, mid, yes = borrower_with_bet(db, 300, market=(mid, [yes, 0]))
     db.execute("UPDATE users SET balance = 5 WHERE id = ?", (ann,))
-    with pytest.raises(appmod.TradeError, match="entry fee"):
-        appmod.seize_position(db, lid, ann, yes, "take")
-    assert shares(db, ann, yes) == 0 and loan(db, lid)["status"] == "active" and bal(db, ann) == 5
+    appmod.seize_position(db, lid, ann, yes, "take")
+    assert shares(db, ann, yes) > 0 and loan(db, lid)["status"] == "repaid" and bal(db, ann) == 5
 
 
 def test_late_fee_is_added_once_when_a_loan_goes_overdue():

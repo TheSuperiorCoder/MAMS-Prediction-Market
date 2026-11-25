@@ -173,7 +173,7 @@ function setupTradeForm(form) {
   const snipeRate = parseFloat(form.dataset.snipeRate) || 0; // buys pay at least this x T x shares x P^2
   // always shown in the summary: Ⓜ0.00 until the last 2 hours before betting closes
   const lateRow = (r, late, sign = '') => late
-    ? row(`Late fee (×${r.late_multiplier}${r.late_fee_to ? `, to ${escapeHtml(r.late_fee_to)}` : ''})`, `${sign}${money(late)}`, 'down')
+    ? row(`Late fee (×${r.late_multiplier}, to house)`, `${sign}${money(late)}`, 'down')
     : row('Late fee', money(0));
   const minOut = form.querySelector('#min-out');
   let timer = null, ctrl = null, quoted = null;  // quoted = { key } of the quote the preview shows
@@ -279,8 +279,6 @@ function setupTradeForm(form) {
             row('You get', `${fmt(res.shares)} shares`) +
             row('Avg price per share', money(res.avg_price)) +
             row('If it wins', `you get ${money(res.shares)} (${signed(res.shares - total)})`, 'up') +
-            (res.est_bonus ? row('<span title="Your share of the money that would be left in the pot if this outcome won right now. It changes as people trade.">+ est. pot bonus</span>',
-                                 `~${money(res.est_bonus)}`, 'up') : '') +
             row('If it loses', `you lose ${money(total)}`, 'down') +
             row('Balance after', money(balance - total)) +
             row('New price', newPct),

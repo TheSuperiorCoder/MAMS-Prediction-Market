@@ -12,6 +12,7 @@ import sqlite3
 import smtplib
 import socket
 import ssl
+import threading
 import time
 from datetime import date, datetime, timedelta
 import email.utils
@@ -61,11 +62,11 @@ def market_b(n_outcomes):
 MIN_RULES_LENGTH = 20
 DISPUTE_WINDOW = timedelta(hours=2)  # how long traders can challenge a proposed result
 DISPUTE_HOURS = int(DISPUTE_WINDOW.total_seconds() // 3600)
-# Making a market costs CREATION_FEE (refunded if you withdraw your proposal, kept if it's rejected), and everyone
-# else pays the market's creator ENTRY_FEE on their first bet in it. Good markets that attract traders earn their
-# creator money; flooding the site with junk proposals costs money.
-CREATION_FEE = 10.0
-ENTRY_FEE = 10.0
+# Market creation and trader entry fees are removed; creators earn up to CREATOR_LEFTOVER_CAP from leftover pot.
+CREATION_FEE = 0.0
+ENTRY_FEE = 0.0
+CREATOR_LEFTOVER_CAP = 1000.0
+CREATOR_LEFTOVER_CAP_CENTS = 100_000
 # Whoever makes a market must also bet at least this much on it, so they have skin in the game.
 CREATOR_MIN_BET = 10.0
 # Late-trading fee, to discourage piling in once the answer is nearly known:
@@ -134,15 +135,13 @@ log = logging.getLogger("mams")
 # Simple in-memory rate limiting (one server process is plenty for a school site).
 # Limits are generous because a whole school can share one public IP address.
 _hits = {}
+_hits_lock = threading.Lock()
 HITS_MAX_KEYS = 10000
 HITS_MAX_WINDOW = 3600  # the longest window any limit uses
 
 
 def _prune_hits(now):
-    """Keep _hits bounded without forgetting live limits. (Clearing everything would let someone wipe every
-    lockout just by trying lots of different usernames.) Drops keys with no hit inside the longest window, then,
-    if still too many, the ones with the fewest recent hits (oldest first), so keys close to a limit survive a flood
-    of one-off keys."""
+    """Keep _hits bounded without forgetting live limits. Caller holds _hits_lock."""
     for key in [k for k, ts in _hits.items() if not ts or now - ts[-1] >= HITS_MAX_WINDOW]:
         del _hits[key]
     if len(_hits) > HITS_MAX_KEYS:
@@ -160,14 +159,15 @@ HEAVY_PAGE_LIMITS = {"user": (60, 60), "ip": (240, 60)}
 
 def rate_limited(key, limit, window_seconds):
     now = time.time()
-    recent = [t for t in _hits.get(key, []) if now - t < window_seconds]
-    limited = len(recent) >= limit
-    if not limited:
-        recent.append(now)
-    _hits[key] = recent
-    if len(_hits) > HITS_MAX_KEYS:
-        _prune_hits(now)
-    return limited
+    with _hits_lock:
+        recent = [t for t in _hits.get(key, []) if now - t < window_seconds]
+        limited = len(recent) >= limit
+        if not limited:
+            recent.append(now)
+        _hits[key] = recent
+        if len(_hits) > HITS_MAX_KEYS:
+            _prune_hits(now)
+        return limited
 
 
 # ---------------------------------------------------------------- database
@@ -176,6 +176,9 @@ def connect():
     db = sqlite3.connect(DB_PATH, isolation_level=None, timeout=10)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
+    db.execute("PRAGMA synchronous = NORMAL")
+    db.execute("PRAGMA temp_store = MEMORY")
+    db.execute("PRAGMA cache_size = -16000")
     return db
 
 
@@ -291,8 +294,9 @@ NEW_COLUMNS = {
                 # Over/Under markets: the line, an optional unit ("%", "minutes"), and the measured result.
                 ("ou_line", "REAL"), ("ou_unit", "TEXT NOT NULL DEFAULT ''"), ("ou_result", "REAL"),
                 ("featured", "INTEGER NOT NULL DEFAULT 0"),
-                # money left in the pot after paying Ⓜ1 per winning share, shared out among the winners
-                ("leftover_paid", "REAL NOT NULL DEFAULT 0")],
+                # money left in the pot after paying Ⓜ1 per winning share, paid to the market creator (capped)
+                ("leftover_paid", "REAL NOT NULL DEFAULT 0"),
+                ("pot_cents", "INTEGER NOT NULL DEFAULT 0")],
     "proposals": [("rules_source", "TEXT NOT NULL DEFAULT ''"), ("rules_otherwise", "TEXT NOT NULL DEFAULT ''"),
                   ("ou_line", "REAL"), ("ou_unit", "TEXT NOT NULL DEFAULT ''"),
                   ("fee", "REAL NOT NULL DEFAULT 0"),  # creation fee paid, refunded on withdrawal
@@ -442,8 +446,20 @@ def mark_loan_rules_start(db):
                (now_str() if running else "1970-01-01 00:00:00",))
 
 
+SCHEMA_VERSION = "2026-11-24-v1"
+
+
 def init_db():
     db = connect()
+    has_settings = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='site_settings'"
+    ).fetchone()
+    if has_settings:
+        ver = db.execute("SELECT value FROM site_settings WHERE key = 'schema_version'").fetchone()
+        if ver and ver["value"] == SCHEMA_VERSION:
+            mark_loan_rules_start(db)
+            db.close()
+            return
     with open(os.path.join(BASE_DIR, "schema.sql")) as f:
         db.executescript(f.read())
     migrate(db)
@@ -453,6 +469,17 @@ def init_db():
     deepen_liquidity(db)
     backfill_activity(db)
     shorten_dispute_windows(db)
+    # Backfill pot_cents for any pre-existing open markets based on net trade spend
+    db.execute(
+        "UPDATE markets SET pot_cents = COALESCE((SELECT CAST(ROUND(SUM(amount) * 100) AS INTEGER) "
+        "FROM trades WHERE trades.market_id = markets.id), 0) "
+        "WHERE status = 'open' AND pot_cents = 0 AND EXISTS (SELECT 1 FROM trades WHERE trades.market_id = markets.id)"
+    )
+    db.execute(
+        "INSERT INTO site_settings (key, value, updated_at) VALUES ('schema_version', ?, datetime('now')) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (SCHEMA_VERSION,),
+    )
     db.close()
 
 
@@ -678,18 +705,13 @@ def get_outcomes(db, market_id):
     return db.execute("SELECT * FROM outcomes WHERE market_id = ? ORDER BY position", (market_id,)).fetchall()
 
 
-def bundle(db, m):
-    """A market plus its outcomes and current prices, ready for templates."""
-    outs = get_outcomes(db, m["id"])
+def _build_bundle(m, outs, stats, has_dispute):
     if m["status"] == "resolved":
         ps = [1.0 if o["id"] == m["resolved_outcome_id"] else 0.0 for o in outs]
     else:
         ps = lmsr.prices([o["shares"] for o in outs], m["b"])
-    stats = db.execute(
-        "SELECT COALESCE(SUM(ABS(amount)), 0) AS volume, COUNT(DISTINCT user_id) AS traders "
-        "FROM trades WHERE market_id = ?", (m["id"],)).fetchone()
     state = market_state(m)
-    if state == "proposed" and open_disputes(db, m["id"]):
+    if state == "proposed" and has_dispute:
         state = "disputed"
     return {
         "m": m,
@@ -701,15 +723,57 @@ def bundle(db, m):
                if m["ou_line"] is not None else None),
         "outcomes": [{"id": o["id"], "label": o["label"], "shares": o["shares"], "price": p}
                      for o, p in zip(outs, ps)],
-        "volume": stats["volume"],
-        "traders": stats["traders"],
+        "volume": stats["volume"] if stats else 0,
+        "traders": stats["traders"] if stats else 0,
     }
 
 
+def bundle(db, m):
+    """A market plus its outcomes and current prices, ready for templates."""
+    outs = get_outcomes(db, m["id"])
+    stats = db.execute(
+        "SELECT COALESCE(SUM(ABS(amount)), 0) AS volume, COUNT(DISTINCT user_id) AS traders "
+        "FROM trades WHERE market_id = ?", (m["id"],)).fetchone()
+    has_dispute = market_state(m) == "proposed" and bool(open_disputes(db, m["id"]))
+    return _build_bundle(m, outs, stats, has_dispute)
+
+
+def bundle_many(db, market_rows):
+    """Batch-build bundles for many markets in 3 queries instead of 2*M+1."""
+    if not market_rows:
+        return []
+    mids = [m["id"] for m in market_rows]
+    ph = ",".join("?" * len(mids))
+    outs_by_mid = {mid: [] for mid in mids}
+    for o in db.execute(f"SELECT * FROM outcomes WHERE market_id IN ({ph}) ORDER BY market_id, position", mids):
+        outs_by_mid[o["market_id"]].append(o)
+    stats_by_mid = {
+        r["market_id"]: r
+        for r in db.execute(
+            f"SELECT market_id, COALESCE(SUM(ABS(amount)), 0) AS volume, COUNT(DISTINCT user_id) AS traders "
+            f"FROM trades WHERE market_id IN ({ph}) GROUP BY market_id", mids
+        )
+    }
+    disputed_mids = set()
+    proposed_mids = [m["id"] for m in market_rows if market_state(m) == "proposed"]
+    if proposed_mids:
+        pph = ",".join("?" * len(proposed_mids))
+        disputed_mids = {
+            r["market_id"]
+            for r in db.execute(
+                f"SELECT DISTINCT market_id FROM disputes WHERE handled_at IS NULL AND market_id IN ({pph})",
+                proposed_mids,
+            )
+        }
+    return [
+        _build_bundle(m, outs_by_mid[m["id"]], stats_by_mid.get(m["id"]), m["id"] in disputed_mids)
+        for m in market_rows
+    ]
+
+
 def price_trends(db, market_ids, points=32):
-    """Per market id: `spark`, a downsampled list of price snapshots (each a list with one price per outcome) for
-    sparklines, and `delta`, each outcome's change since the last snapshot at least 24 hours old (or since the
-    first snapshot when the market is younger than that). Times are school wall-clock strings, like now_str()."""
+    """Per market id: `spark` (<=32 downsampled snapshots) and `delta` (24h change).
+    Only JSON-decodes the selected snapshots rather than every historical row."""
     market_ids = list(market_ids)
     if not market_ids:
         return {}
@@ -717,19 +781,21 @@ def price_trends(db, market_ids, points=32):
     series = {}
     for r in db.execute(f"SELECT market_id, prices, created_at FROM price_history WHERE market_id IN "
                         f"({','.join('?' * len(market_ids))}) ORDER BY id", market_ids):
-        series.setdefault(r["market_id"], []).append((r["created_at"], json.loads(r["prices"])))
+        series.setdefault(r["market_id"], []).append((r["created_at"], r["prices"]))
     out = {}
     for mid, s in series.items():
-        latest = s[-1][1]
-        base = s[0][1]
-        for t, p in s:
+        latest_raw = s[-1][1]
+        base_raw = s[0][1]
+        for t, p_raw in s:
             if t <= cutoff:
-                base = p
+                base_raw = p_raw
             else:
                 break
         if len(s) > points:  # keep the first and last snapshot, evenly spaced in between
             s = [s[round(i * (len(s) - 1) / (points - 1))] for i in range(points)]
-        out[mid] = {"spark": [p for _, p in s], "delta": [a - b for a, b in zip(latest, base)]}
+        latest = json.loads(latest_raw)
+        base = json.loads(base_raw)
+        out[mid] = {"spark": [json.loads(p_raw) for _, p_raw in s], "delta": [a - b for a, b in zip(latest, base)]}
     return out
 
 
@@ -761,9 +827,17 @@ def snapshot_prices(db, market_id, b):
 def open_book_values(db):
     """{user_id: {market_id: cash-out value}} for every unresolved market. Each value is what the user's
     whole holding in that market would sell for right now, so buying can't inflate it."""
+    open_rows = db.execute("SELECT id, b FROM markets WHERE status = 'open'").fetchall()
+    if not open_rows:
+        return {}
+    outs_by_mid = {m["id"]: [] for m in open_rows}
+    mids = list(outs_by_mid.keys())
+    ph = ",".join("?" * len(mids))
+    for o in db.execute(f"SELECT id, market_id, shares FROM outcomes WHERE market_id IN ({ph}) ORDER BY market_id, position", mids):
+        outs_by_mid[o["market_id"]].append(o)
     markets = {}
-    for m in db.execute("SELECT * FROM markets WHERE status = 'open'").fetchall():
-        outs = get_outcomes(db, m["id"])
+    for m in open_rows:
+        outs = outs_by_mid[m["id"]]
         markets[m["id"]] = (m["b"], [o["shares"] for o in outs], {o["id"]: i for i, o in enumerate(outs)})
     holdings = {}  # (user_id, market_id) -> share vector
     for p in db.execute("SELECT p.user_id, p.outcome_id, p.shares, o.market_id FROM positions p "
@@ -780,6 +854,7 @@ def open_book_values(db):
 
 NET_WORTH_TTL = 30  # seconds; the cache is also dropped as soon as any trade, balance or loan changes
 _net_worth_cache = {}
+_net_worth_lock = threading.Lock()
 
 
 def net_worths(db):
@@ -790,11 +865,13 @@ def net_worths(db):
         "(SELECT COUNT(*) FROM users), (SELECT ROUND(SUM(balance), 2) FROM users), "
         "(SELECT COUNT(*) FROM loans), (SELECT ROUND(SUM(owed + principal), 2) FROM loans "
         "WHERE status IN ('offered', 'active')), (SELECT COUNT(*) FROM markets WHERE status = 'open')").fetchone())
-    hit = _net_worth_cache.get("v")
-    if hit and hit[0] == version and time.time() - hit[1] < NET_WORTH_TTL:
-        return dict(hit[2])
+    with _net_worth_lock:
+        hit = _net_worth_cache.get("v")
+        if hit and hit[0] == version and time.time() - hit[1] < NET_WORTH_TTL:
+            return dict(hit[2])
     worth = _compute_net_worths(db)
-    _net_worth_cache["v"] = (version, time.time(), worth)
+    with _net_worth_lock:
+        _net_worth_cache["v"] = (version, time.time(), worth)
     return dict(worth)
 
 
@@ -829,15 +906,8 @@ def log_activity(db, user_id, kind, amount, market=None, detail=""):
 
 
 def entry_fee_due(db, m, user_id):
-    """What this user owes the creator before their next bet in market m: ENTRY_FEE on their first bet, else 0.
-    Nothing is owed on markets without a creator, by the creator, or by anyone who traded before fees existed."""
-    if m["created_by"] is None or user_id == m["created_by"]:
-        return 0.0
-    if db.execute("SELECT 1 FROM market_entries WHERE market_id = ? AND user_id = ?", (m["id"], user_id)).fetchone():
-        return 0.0
-    if db.execute("SELECT 1 FROM trades WHERE market_id = ? AND user_id = ? LIMIT 1", (m["id"], user_id)).fetchone():
-        return 0.0
-    return ENTRY_FEE
+    """Entry fees are disabled; kept as 0.0 for API compatibility."""
+    return 0.0
 
 
 def creator_name(db, m):
@@ -865,51 +935,8 @@ def refund_entry_fees(db, market_id, user_id=None, reason="Entry fee refunded"):
 
 
 def leftover_bonus(db, user_id, market_id):
-    """The user's share of a resolved market's leftover pot (0 if none)."""
-    return db.execute("SELECT COALESCE(SUM(amount), 0) FROM activity WHERE user_id = ? AND market_id = ? "
-                      "AND kind = 'payout' AND detail LIKE 'Bonus:%'", (user_id, market_id)).fetchone()[0]
-
-
-def leftover_and_weights(db, market_id, outcome_id, extra=None):
-    """If outcome_id wins: (leftover, {user_id: unhedged winning shares}).
-
-    `extra` = (user_key, bought_outcome_id, shares, money) adds a hypothetical buy on top of the real positions,
-    used to preview the bonus a bet would get. user_key can be a user id or any placeholder for a visitor.
-
-    leftover = the pot (money traders put in minus what they took out selling) minus Ⓜ1 per winning share,
-    rounded to the cent. It's shared by *unhedged* winning shares: your winning shares minus the shares you hold
-    on every outcome at once. A full set of outcomes always costs exactly Ⓜ1 and always pays exactly Ⓜ1, so it
-    carries no risk and earns no bonus; otherwise anyone could buy big equal sets and take the leftover from
-    the people who actually bet on an outcome."""
-    pot = db.execute("SELECT COALESCE(SUM(amount), 0) FROM trades WHERE market_id = ?", (market_id,)).fetchone()[0]
-    outcome_ids = [o["id"] for o in get_outcomes(db, market_id)]
-    held = {}
-    for p in db.execute("SELECT p.user_id, p.outcome_id, p.shares FROM positions p JOIN outcomes o "
-                        "ON o.id = p.outcome_id WHERE o.market_id = ?", (market_id,)):
-        held.setdefault(p["user_id"], {})[p["outcome_id"]] = p["shares"]
-    if extra:
-        who, bought, shares, money = extra
-        mine = held.setdefault(who, {})
-        mine[bought] = mine.get(bought, 0.0) + shares
-        pot += money
-    winning = sum(h.get(outcome_id, 0.0) for h in held.values())
-    weights = {}
-    for uid, h in held.items():
-        hedged = min(h.get(oid, 0.0) for oid in outcome_ids)
-        unhedged = h.get(outcome_id, 0.0) - hedged
-        if unhedged > EPS:
-            weights[uid] = unhedged
-    return cents(pot - winning), weights
-
-
-def estimated_bonus(db, market_id, outcome_id, user_id, extra=None):
-    """If this outcome won right now, roughly what this user's share of the leftover pot would be. It's computed
-    exactly like the real payout, but changes with every trade. Pass `extra` to include a bet not yet placed."""
-    leftover, weights = leftover_and_weights(db, market_id, outcome_id, extra)
-    total = sum(weights.values())
-    if leftover < 0.01 or user_id not in weights:
-        return 0.0
-    return math.floor(leftover * weights[user_id] / total * 100) / 100
+    """Legacy helper: winners no longer receive leftover pot bonuses."""
+    return 0.0
 
 
 def trade_block_reason(db, user_id, market_id):
@@ -1000,59 +1027,66 @@ def late_fee(shares, avg_price, t, buy=True):
 
 
 def check_trade(m, outs, idx, action, value, balance=None, held=None, fee=0.0):
-    """Validate a trade and price it. Returns (shares, coins, late): shares bought/sold, coins spent/received
-    before fees, and the late-trading fee. Raises TradeError with a user-facing message. balance/held may be None
-    to skip those checks (used for logged-out quotes). Shared by execute_trade and the /api/quote preview so they
-    always agree. `fee` is the entry fee owed on this buy, if any."""
-    q = [o["shares"] for o in outs]
+    """Validate a trade and price it with fixed-point cent / centi-share arithmetic and
+    anti-arbitrage asymmetric rounding (floor bought shares + ceil buy cost, floor sell proceeds).
+    Returns (shares, coins, late).
+    """
+    q_centi = [lmsr.to_centi_shares(o["shares"]) for o in outs]
     label = outs[idx]["label"]
     t = late_multiplier(m)
     if action == "buy":
-        amount = cents(value)
-        if amount < MIN_BET:
+        spend_cents = lmsr.to_cents(value)
+        if spend_cents < lmsr.to_cents(MIN_BET):
             raise TradeError(f"Minimum bet is Ⓜ{MIN_BET:.0f}.")
-        shares = lmsr.shares_for_amount(q, m["b"], idx, amount)
-        late = late_fee(shares, amount / shares, t)
-        if balance is not None and amount + fee + late > balance + EPS:
-            extras = [f"Ⓜ{amount:,.2f} bet"]
-            if fee:
-                extras.append(f"Ⓜ{fee:,.0f} entry fee")
+        try:
+            shares_centi, cost_cents = lmsr.quote_buy_cents(q_centi, m["b"], idx, spend_cents)
+        except ValueError as e:
+            raise TradeError(str(e))
+        shares = lmsr.from_centi_shares(shares_centi)
+        coins = lmsr.from_cents(cost_cents)
+        late = late_fee(shares, coins / shares, t)
+        late_cents = lmsr.to_cents(late)
+        if balance is not None and cost_cents + late_cents > lmsr.to_cents(balance):
             if late:
-                extras.append(f"Ⓜ{late:,.2f} late trading fee")
-            if len(extras) > 1:
-                raise TradeError(f"You need Ⓜ{amount + fee + late:,.2f} ({' + '.join(extras)}) "
-                                 f"but have Ⓜ{balance:,.2f}.")
+                raise TradeError(
+                    f"You need Ⓜ{coins + late:,.2f} (Ⓜ{coins:,.2f} bet + Ⓜ{late:,.2f} late trading fee) "
+                    f"but have Ⓜ{balance:,.2f}."
+                )
             raise TradeError(f"You don't have enough for that bet. Your balance is Ⓜ{balance:,.2f}.")
-        return shares, amount, late
+        return shares, coins, late
     if action == "sell":
         shares = value
         if held is not None and abs(shares - held) < 1e-6:
             shares = held
-        if shares <= EPS:
+        sell_centi = lmsr.to_centi_shares(shares)
+        held_centi = lmsr.to_centi_shares(held) if held is not None else None
+        if sell_centi <= 0:
             raise TradeError("Enter a number of shares to sell.")
-        if held is not None and shares > held + EPS:
+        if held_centi is not None and sell_centi > held_centi:
             raise TradeError(f"You only own {held:.2f} shares of “{label}”.")
-        coins = math.floor(lmsr.sell_value(q, m["b"], idx, shares) * 100) / 100
-        if coins < 0.01:
+        if sell_centi > q_centi[idx]:
+            raise TradeError("Cannot sell more shares than outstanding in the market.")
+        proceeds_cents = lmsr.quote_sell_cents(q_centi, m["b"], idx, sell_centi)
+        if proceeds_cents < 1:
             raise TradeError("That's worth less than Ⓜ0.01. Sell more shares at once.")
+        shares = lmsr.from_centi_shares(sell_centi)
+        coins = lmsr.from_cents(proceeds_cents)
         return shares, coins, min(late_fee(shares, coins / shares, t, buy=False), coins)
     raise TradeError("Unknown action.")
 
 
 def set_position(db, user_id, outcome_id, shares, cost):
     """Store a user's holding of one outcome (removing it when nothing is left). Call inside a transaction."""
-    if shares <= 1e-9:
+    if lmsr.to_centi_shares(shares) <= 0:
         db.execute("DELETE FROM positions WHERE user_id = ? AND outcome_id = ?", (user_id, outcome_id))
     else:
         db.execute("INSERT INTO positions (user_id, outcome_id, shares, cost) VALUES (?, ?, ?, ?) "
                    "ON CONFLICT(user_id, outcome_id) DO UPDATE SET shares = excluded.shares, cost = excluded.cost",
-                   (user_id, outcome_id, shares, cost))
+                   (user_id, outcome_id, lmsr.from_centi_shares(lmsr.to_centi_shares(shares)), cents(cost)))
 
 
 def execute_trade(db, user_id, market_id, outcome_id, action, value, min_out=None):
-    """Buy (value = coins to spend) or sell (value = shares to sell). Returns a status message.
-    min_out (optional) is the least the trader will accept: shares for a buy, coins for a sell. It guards
-    against the price moving between the quote and the trade."""
+    """Buy (value = coins to spend) or sell (value = shares to sell). Returns a status message."""
     db.execute("BEGIN IMMEDIATE")
     try:
         m = db.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
@@ -1079,52 +1113,49 @@ def execute_trade(db, user_id, market_id, outcome_id, action, value, min_out=Non
         held = pos["shares"] if pos else 0.0
         held_cost = pos["cost"] if pos else 0.0
 
-        fee = entry_fee_due(db, m, user_id) if action == "buy" else 0.0
-        shares, coins, late = check_trade(m, outs, idx, action, value, user["balance"], held, fee)
+        shares, coins, late = check_trade(m, outs, idx, action, value, user["balance"], held, 0.0)
         if min_out is not None and (shares if action == "buy" else coins) < min_out - 1e-9:
             raise TradeError("The price moved since your quote. Check the new quote and try again.")
-        if fee:
-            creator = creator_name(db, m)
-            db.execute("UPDATE users SET balance = ROUND(balance - ?, 2) WHERE id = ?", (fee, user_id))
-            log_activity(db, user_id, "fee", -fee, m, f"Entry fee (first bet), paid to {creator}")
-            db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (fee, m["created_by"]))
-            log_activity(db, m["created_by"], "earning", fee, m, f"Entry fee from {user['username']}")
-            db.execute("INSERT INTO market_entries (market_id, user_id, creator_id, fee, created_at) VALUES (?, ?, ?, ?, ?)",
-                       (market_id, user_id, m["created_by"], fee, now_str()))
+
+        shares_centi = lmsr.to_centi_shares(shares)
+        coins_cents = lmsr.to_cents(coins)
+        late_cents = lmsr.to_cents(late)
+        held_centi = lmsr.to_centi_shares(held)
+
         q[idx] += shares if action == "buy" else -shares
         now_pct = lmsr.prices(q, m["b"])[idx] * 100
         if action == "buy":
-            d_shares, d_cash = shares, -coins
-            new_shares, new_cost = held + shares, held_cost + coins
-            msg = (f"You paid Ⓜ{coins:,.2f} for {shares:,.2f} shares of “{label}”"
-                   + (f" plus a Ⓜ{fee:,.0f} entry fee to {creator}" if fee else "") +
-                   f". If it wins they pay Ⓜ{new_shares:,.2f} in total. Price now {now_pct:.0f}%.")
+            d_shares_centi, d_cash_cents = shares_centi, -coins_cents
+            new_shares = lmsr.from_centi_shares(held_centi + shares_centi)
+            new_cost = lmsr.from_cents(lmsr.to_cents(held_cost) + coins_cents)
+            msg = (f"You paid Ⓜ{coins:,.2f} for {shares:,.2f} shares of “{label}”."
+                   f" If it wins they pay Ⓜ{new_shares:,.2f} in total. Price now {now_pct:.0f}%.")
             detail = f"Bought {shares:,.2f} shares of “{label}”"
         else:
-            d_shares, d_cash = -shares, coins
-            new_shares = held - shares
-            new_cost = held_cost * (new_shares / held) if held > 0 else 0.0
+            d_shares_centi, d_cash_cents = -shares_centi, coins_cents
+            new_shares_centi = held_centi - shares_centi
+            new_shares = lmsr.from_centi_shares(new_shares_centi)
+            new_cost = held_cost * (new_shares_centi / held_centi) if held_centi > 0 else 0.0
             msg = f"You received Ⓜ{coins:,.2f} for {shares:,.2f} shares of “{label}”. Price now {now_pct:.0f}%."
             detail = f"Sold {shares:,.2f} shares of “{label}”"
 
-        db.execute("UPDATE outcomes SET shares = shares + ? WHERE id = ?", (d_shares, outcome_id))
-        db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (d_cash, user_id))
+        d_shares = d_shares_centi / lmsr.SHARES_SCALE
+        d_cash = lmsr.from_cents(d_cash_cents)
+        new_outcome_shares = lmsr.from_centi_shares(lmsr.to_centi_shares(outs[idx]["shares"]) + d_shares_centi)
+        db.execute("UPDATE outcomes SET shares = ? WHERE id = ?", (new_outcome_shares, outcome_id))
+        new_bal = lmsr.from_cents(lmsr.to_cents(user["balance"]) + d_cash_cents)
+        db.execute("UPDATE users SET balance = ? WHERE id = ?", (new_bal, user_id))
+        db.execute("UPDATE markets SET pot_cents = pot_cents + ? WHERE id = ?", (-d_cash_cents, market_id))
         log_activity(db, user_id, action, d_cash, m, detail)
-        if late:
+        if late_cents > 0:
             t = late_multiplier(m)
-            # Paid to the market's creator; on markets without one, or when the creator trades their own market
-            # late, it leaves the game instead (paying yourself would cancel the penalty).
-            payee = m["created_by"] if m["created_by"] not in (None, user_id) else None
-            payee_name = creator_name(db, m) if payee else None
-            db.execute("UPDATE users SET balance = ROUND(balance - ?, 2) WHERE id = ?", (late, user_id))
-            log_activity(db, user_id, "fee", -late, m,
-                         f"Late trading fee (×{fmt_number(t)}, {shares:,.2f} shares at {coins / shares * 100:.0f}¢)"
-                         + (f", paid to {payee_name}" if payee else ""))
-            if payee:
-                db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (late, payee))
-                log_activity(db, payee, "earning", late, m, f"Late trading fee from {user['username']}")
-            msg += f" Late trading fee: Ⓜ{late:,.2f}" + (f" (paid to {payee_name})." if payee else ".")
-        msg += f" Balance: Ⓜ{db.execute('SELECT balance FROM users WHERE id = ?', (user_id,)).fetchone()[0]:,.2f}."
+            # Late trading fees are paid to the house (removed from circulation) rather than the market creator.
+            new_bal = lmsr.from_cents(lmsr.to_cents(new_bal) - late_cents)
+            db.execute("UPDATE users SET balance = ? WHERE id = ?", (new_bal, user_id))
+            log_activity(db, user_id, "fee", -lmsr.from_cents(late_cents), m,
+                         f"Late trading fee (×{fmt_number(t)}, {shares:,.2f} shares at {coins / shares * 100:.0f}¢)")
+            msg += f" Late trading fee: Ⓜ{late:,.2f}."
+        msg += f" Balance: Ⓜ{new_bal:,.2f}."
         set_position(db, user_id, outcome_id, new_shares, new_cost)
         db.execute("INSERT INTO trades (user_id, market_id, outcome_id, shares, amount, created_at) "
                    "VALUES (?, ?, ?, ?, ?, ?)", (user_id, market_id, outcome_id, d_shares, -d_cash, now_str()))
@@ -1137,8 +1168,8 @@ def execute_trade(db, user_id, market_id, outcome_id, action, value, min_out=Non
 
 
 def resolve_market(db, market_id, outcome_id, resolved_by=None, automatic=False):
-    """Pay out a market. `automatic` is used when a challenge window ends: it only goes ahead if the proposed
-    result is still the same, the window is over and nobody has an unhandled dispute."""
+    """Pay out a market: winners receive Ⓜ1 per share; any leftover pot up to CREATOR_LEFTOVER_CAP
+    goes to the market creator."""
     db.execute("BEGIN IMMEDIATE")
     try:
         m = db.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
@@ -1153,32 +1184,42 @@ def resolve_market(db, market_id, outcome_id, resolved_by=None, automatic=False)
                 raise TradeError("Not ready to finalize.")
         outs = {o["id"]: o["label"] for o in get_outcomes(db, market_id)}
         winners = db.execute("SELECT user_id, shares FROM positions WHERE outcome_id = ?", (outcome_id,)).fetchall()
+        winning_centi = 0
         for w in winners:
-            db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (w["shares"], w["user_id"]))
-            log_activity(db, w["user_id"], "payout", w["shares"], m,
-                         f"Won: {w['shares']:,.2f} “{outs[outcome_id]}” shares paid Ⓜ1 each")
-        # Whatever is left in the pot after paying Ⓜ1 per winning share goes to the winners in proportion to their
-        # unhedged winning shares (see leftover_and_weights). If the pot is short, the house covers the gap.
-        # Positions aren't changed by paying out, so computing this after the Ⓜ1 payments above is fine.
-        leftover, weights = leftover_and_weights(db, market_id, outcome_id)
-        total_weight = sum(weights.values())
-        leftover_paid = 0.0
-        if leftover >= 0.01 and total_weight > EPS:
-            for uid, weight in weights.items():
-                cut = math.floor(leftover * weight / total_weight * 100) / 100
-                if cut >= 0.01:
-                    db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (cut, uid))
-                    log_activity(db, uid, "payout", cut, m,
-                                 f"Bonus: your share of the Ⓜ{leftover:,.2f} left in the pot")
-                    leftover_paid += cut
+            payout_cents = lmsr.to_centi_shares(w["shares"])
+            if payout_cents <= 0:
+                continue
+            winning_centi += payout_cents
+            payout = lmsr.from_cents(payout_cents)
+            db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (payout, w["user_id"]))
+            log_activity(db, w["user_id"], "payout", payout, m,
+                         f"Won: {lmsr.from_centi_shares(payout_cents):,.2f} “{outs[outcome_id]}” shares paid Ⓜ1 each")
+
+        # Leftover pot (net trader cash minus Ⓜ1 per winning share) goes to the market creator,
+        # capped at CREATOR_LEFTOVER_CAP (1000 tokens).
+        pot_cents = m["pot_cents"] if "pot_cents" in m.keys() and m["pot_cents"] != 0 else lmsr.to_cents(
+            db.execute("SELECT COALESCE(SUM(amount), 0) FROM trades WHERE market_id = ?", (market_id,)).fetchone()[0]
+        )
+        leftover_cents = pot_cents - winning_centi
+        creator_paid = 0.0
+        if leftover_cents >= 1 and m["created_by"] is not None:
+            creator_row = db.execute("SELECT id FROM users WHERE id = ?", (m["created_by"],)).fetchone()
+            if creator_row is not None:
+                cut_cents = min(leftover_cents, CREATOR_LEFTOVER_CAP_CENTS)
+                creator_paid = lmsr.from_cents(cut_cents)
+                db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?",
+                           (creator_paid, m["created_by"]))
+                log_activity(db, m["created_by"], "earning", creator_paid, m,
+                             f"Creator profit: Ⓜ{creator_paid:,.2f} from leftover pot")
+
         for p in db.execute("SELECT p.user_id, p.shares, p.outcome_id FROM positions p JOIN outcomes o "
                             "ON o.id = p.outcome_id WHERE o.market_id = ? AND p.outcome_id != ? AND p.shares > 1e-9",
                             (market_id, outcome_id)).fetchall():
             log_activity(db, p["user_id"], "loss", 0, m,
                          f"Lost: {p['shares']:,.2f} “{outs[p['outcome_id']]}” shares paid nothing")
         db.execute("UPDATE markets SET status = 'resolved', resolved_outcome_id = ?, resolved_at = ?, "
-                   "resolved_by = ?, leftover_paid = ? WHERE id = ?",
-                   (outcome_id, now_str(), resolved_by, cents(leftover_paid), market_id))
+                   "resolved_by = ?, leftover_paid = ?, pot_cents = 0 WHERE id = ?",
+                   (outcome_id, now_str(), resolved_by, creator_paid, market_id))
         db.execute("UPDATE disputes SET handled_at = ? WHERE market_id = ? AND handled_at IS NULL",
                    (now_str(), market_id))
         db.execute("COMMIT")
@@ -1257,19 +1298,49 @@ def add_dispute(db, user_id, market_id, reason):
                (market_id, user_id, reason, now_str()))
 
 
+def _radial_refund_market(db, m, reason, clear_positions=True):
+    """Unwind all positions in an unresolved market radially through LMSR so identical
+    holders receive identical exit prices and total refunds never exceed pool cash.
+    Must run inside a transaction. Returns {user_id: refund_cents}.
+    """
+    market_id = m["id"]
+    outs = get_outcomes(db, market_id)
+    idx_by_oid = {o["id"]: i for i, o in enumerate(outs)}
+    q_centi = [lmsr.to_centi_shares(o["shares"]) for o in outs]
+    pos_rows = db.execute(
+        "SELECT p.user_id, p.outcome_id, p.shares FROM positions p JOIN outcomes o ON o.id = p.outcome_id "
+        "WHERE o.market_id = ? AND p.shares > 0",
+        (market_id,),
+    ).fetchall()
+    pos_centi = [
+        (p["user_id"], idx_by_oid[p["outcome_id"]], lmsr.to_centi_shares(p["shares"]))
+        for p in pos_rows
+        if p["outcome_id"] in idx_by_oid
+    ]
+    refunds, _ = lmsr.radial_void_payouts(q_centi, m["b"], pos_centi)
+    by_user = {}
+    for uid, _idx, _sc, rc in refunds:
+        by_user[uid] = by_user.get(uid, 0) + rc
+    for uid, rc in by_user.items():
+        amt = lmsr.from_cents(rc)
+        if rc > 0:
+            db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (amt, uid))
+        log_activity(db, uid, "refund", amt, m, reason)
+    db.execute("UPDATE outcomes SET shares = 0 WHERE market_id = ?", (market_id,))
+    if clear_positions:
+        db.execute("DELETE FROM positions WHERE outcome_id IN (SELECT id FROM outcomes WHERE market_id = ?)", (market_id,))
+    db.execute("UPDATE markets SET pot_cents = 0 WHERE id = ?", (market_id,))
+    return by_user
+
+
 def cancel_market(db, market_id):
-    """Void a market: everyone gets back what they net-spent on it."""
+    """Void a market: unwind open positions radially through LMSR."""
     db.execute("BEGIN IMMEDIATE")
     try:
         m = db.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
         if m is None or m["status"] != "open":
             raise TradeError("Only unresolved markets can be cancelled.")
-        rows = db.execute("SELECT user_id, SUM(amount) AS net FROM trades WHERE market_id = ? GROUP BY user_id",
-                          (market_id,)).fetchall()
-        for r in rows:
-            if r["net"] > 0:
-                db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (r["net"], r["user_id"]))
-            log_activity(db, r["user_id"], "refund", max(r["net"], 0), m, "Refund: market cancelled")
+        _radial_refund_market(db, m, "Refund: market cancelled", clear_positions=False)
         refund_entry_fees(db, market_id, reason="Entry fee refunded: market cancelled")
         # A proposed or disputed result is moot once the market is void.
         db.execute("UPDATE disputes SET handled_at = ? WHERE market_id = ? AND handled_at IS NULL",
@@ -1283,7 +1354,7 @@ def cancel_market(db, market_id):
 
 
 def delete_market(db, market_id):
-    """Remove a market entirely. If it was never settled, everyone's net spend is refunded first.
+    """Remove a market entirely. If it was never settled, positions are unwound radially via LMSR first.
     Payouts from an already-resolved market are kept."""
     db.execute("BEGIN IMMEDIATE")
     try:
@@ -1291,12 +1362,7 @@ def delete_market(db, market_id):
         if m is None:
             raise TradeError("Market not found.")
         if m["status"] == "open":
-            for r in db.execute("SELECT user_id, SUM(amount) AS net FROM trades WHERE market_id = ? GROUP BY user_id",
-                                (market_id,)).fetchall():
-                if r["net"] > 0:
-                    db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?",
-                               (r["net"], r["user_id"]))
-                log_activity(db, r["user_id"], "refund", max(r["net"], 0), m, "Refund: market deleted")
+            _radial_refund_market(db, m, "Refund: market deleted")
             refund_entry_fees(db, market_id, reason="Entry fee refunded: market deleted")
         db.execute("DELETE FROM positions WHERE outcome_id IN (SELECT id FROM outcomes WHERE market_id = ?)",
                    (market_id,))
@@ -1315,15 +1381,9 @@ def create_market(db, question, description, category, closes_at, labels, b, cre
                   rules_source="", rules_otherwise="", ou_line=None, ou_unit="", charge_fee=False):
     db.execute("BEGIN IMMEDIATE")
     try:
-        if charge_fee:  # an admin making a market directly pays the same fee as a proposer
-            bal = db.execute("SELECT balance FROM users WHERE id = ?", (created_by,)).fetchone()["balance"]
-            if bal + EPS < CREATION_FEE:
-                raise TradeError(f"Making a market costs Ⓜ{CREATION_FEE:,.0f}. You have Ⓜ{bal:,.2f}.")
-            db.execute("UPDATE users SET balance = ROUND(balance - ?, 2) WHERE id = ?", (CREATION_FEE, created_by))
-            log_activity(db, created_by, "fee", -CREATION_FEE, None, f"Market creation fee: “{question}”")
         cur = db.execute(
             "INSERT INTO markets (question, description, category, b, closes_at, created_by, created_at, "
-            "rules_source, rules_otherwise, ou_line, ou_unit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "rules_source, rules_otherwise, ou_line, ou_unit, pot_cents) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
             (question, description, category, b, closes_at, created_by, now_str(), rules_source, rules_otherwise,
              ou_line, ou_unit or ""))
         mid = cur.lastrowid
@@ -1345,6 +1405,23 @@ def csrf_token():
     return session["_csrf"]
 
 
+BOOKKEEPING_INTERVAL = 10.0
+_last_bookkeeping = {}
+_bookkeeping_lock = threading.Lock()
+
+
+def _should_run_bookkeeping():
+    if app.config.get("TESTING"):
+        return True
+    now = time.time()
+    with _bookkeeping_lock:
+        last = _last_bookkeeping.get(DB_PATH, 0.0)
+        if now - last < BOOKKEEPING_INTERVAL:
+            return False
+        _last_bookkeeping[DB_PATH] = now
+        return True
+
+
 @app.before_request
 def load_user_and_check_csrf():
     g.user = None
@@ -1361,9 +1438,10 @@ def load_user_and_check_csrf():
         elif g.user["id"] == g.owner_id and not g.user["is_admin"]:
             db.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (g.user["id"],))  # owner is always admin
             g.user = db.execute("SELECT * FROM users WHERE id = ?", (g.user["id"],)).fetchone()
-    if request.endpoint not in PWA_ENDPOINTS:
-        finalize_due(get_db())
-        collect_overdue_loans(get_db())
+    if request.endpoint not in PWA_ENDPOINTS and request.endpoint != "quote":
+        if _should_run_bookkeeping():
+            finalize_due(get_db())
+            collect_overdue_loans(get_db())
     if request.method == "POST":
         token = request.form.get("csrf_token", "")
         if not token or not secrets.compare_digest(token, session.get("_csrf", "")):
@@ -1818,7 +1896,10 @@ def pct_filter(p):
 
 @app.template_filter("when")
 def when_filter(s):
-    return parse_dt(s).strftime("%b %-d, %Y %-I:%M %p")
+    dt = parse_dt(s)
+    hour = dt.hour % 12 or 12
+    ampm = "AM" if dt.hour < 12 else "PM"
+    return f"{dt.strftime('%b')} {dt.day}, {dt.year} {hour}:{dt.minute:02d} {ampm}"
 
 
 @app.template_filter("ago")
@@ -2034,7 +2115,8 @@ def login():
             return render_template("login.html")
         name = request.form.get("username", "").strip()
         fail_key = ("login-fail", name.lower())
-        recent_fails = [t for t in _hits.get(fail_key, []) if time.time() - t < 300]
+        with _hits_lock:
+            recent_fails = [t for t in _hits.get(fail_key, []) if time.time() - t < 300]
         if len(recent_fails) >= 10:
             log_event("login_locked", username=name if USERNAME_RE.match(name) else "", detail="10 wrong passwords in 5 minutes")
             flash("Too many wrong passwords for this account. Wait 5 minutes and try again.", "error")
@@ -2043,7 +2125,8 @@ def login():
         # Unknown usernames still pay for a hash check, so response time doesn't reveal which accounts exist.
         ok = check_password_hash(u["password_hash"] if u else DUMMY_PASSWORD_HASH, request.form.get("password", ""))
         if u and ok:
-            _hits.pop(fail_key, None)
+            with _hits_lock:
+                _hits.pop(fail_key, None)
             session.clear()
             session.permanent = True
             session["uid"] = u["id"]
@@ -2170,12 +2253,13 @@ def code_wait(user_id, email):
     later). 0 means go ahead, and starts the next wait."""
     keys = [("email-code-minute", user_id), ("email-code-to", security.normalize_email(email)[1] or email.casefold())]
     now = time.time()
-    last = max((t for k in keys for t in _hits.get(k, [])), default=0.0)
-    left = LOGIN_CODE_RESEND_DELAY - (now - last)
-    if left > 0:
-        return math.ceil(left)
-    for k in keys:
-        _hits[k] = [now]
+    with _hits_lock:
+        last = max((t for k in keys for t in _hits.get(k, [])), default=0.0)
+        left = LOGIN_CODE_RESEND_DELAY - (now - last)
+        if left > 0:
+            return math.ceil(left)
+        for k in keys:
+            _hits[k] = [now]
     return 0
 
 
@@ -2285,7 +2369,8 @@ def set_temporary_password(db, user_id):
     name = db.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()["username"]
     db.execute("UPDATE users SET password_hash = ?, session_gen = session_gen + 1 WHERE id = ?",
                (generate_password_hash(pw), user_id))
-    _hits.pop(("login-fail", name.lower()), None)
+    with _hits_lock:
+        _hits.pop(("login-fail", name.lower()), None)
     return pw
 
 
@@ -2367,7 +2452,7 @@ def index():
     status = status if status in dict(STATUS_TABS) else "open"
     cat = request.args.get("cat", "")
     cat = cat if cat in CATEGORIES else ""
-    markets = [bundle(db, m) for m in db.execute("SELECT * FROM markets ORDER BY closes_at").fetchall()]
+    markets = bundle_many(db, db.execute("SELECT * FROM markets ORDER BY closes_at").fetchall())
 
     def sort_key(b):
         rank = STATE_ORDER.index(b["state"])
@@ -2450,15 +2535,7 @@ def market(mid):
                      else 0.0 if b["m"]["status"] == "cancelled"
                      else lmsr.sell_value(q, b["m"]["b"], index[p["outcome_id"]], p["shares"]))
             my_positions.append({"outcome": o, "shares": p["shares"], "cost": p["cost"], "value": value,
-                                 "bonus": 0.0,
-                                 "est_bonus": estimated_bonus(db, mid, p["outcome_id"], g.user["id"])
-                                 if b["m"]["status"] == "open" else 0.0})
-        if b["m"]["status"] == "resolved":  # the leftover-pot bonus belongs with the winning position
-            bonus = leftover_bonus(db, g.user["id"], mid)
-            for p in my_positions:
-                if p["outcome"]["id"] == b["m"]["resolved_outcome_id"]:
-                    p["bonus"] = bonus
-                    p["value"] += bonus
+                                 "bonus": 0.0, "est_bonus": 0.0})
     block_reason = trade_block_reason(db, g.user["id"], mid) if g.user else None
     blocked, all_users = [], []
     if g.user and g.user["is_admin"]:
@@ -2629,13 +2706,8 @@ def quote():
         return jsonify(ok=False, error=str(e))
     q = [o["shares"] for o in outs]
     q[i] += shares if action == "buy" else -shares
-    late_to = creator_name(db, m) if m["created_by"] is not None and not (g.user and g.user["id"] == m["created_by"]) else None
-    est_bonus = 0.0
-    if action == "buy":  # the leftover-pot bonus this bet would get if its outcome won right after it
-        who = g.user["id"] if g.user else "visitor"
-        est_bonus = estimated_bonus(db, mid, oid, who, (who, oid, shares, coins))
-    return jsonify(ok=True, shares=round(shares, 4), coins=coins, entry_fee=fee, creator=creator_name(db, m),
-                   late_fee=late, late_multiplier=late_multiplier(m), late_fee_to=late_to, est_bonus=est_bonus,
+    return jsonify(ok=True, shares=round(shares, 4), coins=coins, entry_fee=0.0, creator=creator_name(db, m),
+                   late_fee=late, late_multiplier=late_multiplier(m), late_fee_to=None, est_bonus=0.0,
                    avg_price=coins / shares if shares else 0,
                    new_price=lmsr.prices(q, m["b"])[i])
 
@@ -2667,12 +2739,14 @@ def portfolio():
             value = 0.0  # refunded when the market was cancelled
         else:
             value = r["shares"] * price
-        bonus = leftover_bonus(db, uid, r["market_id"]) if b["m"]["status"] == "resolved" and price > 0 else 0.0
+        bonus = 0.0
         refund = None
         if b["m"]["status"] == "cancelled":
-            refund = cents(max(db.execute("SELECT COALESCE(SUM(amount), 0) FROM trades WHERE user_id = ? AND market_id = ?",
-                                          (uid, r["market_id"])).fetchone()[0], 0.0))
-        item = {"r": r, "b": b, "price": price, "value": value + bonus, "bonus": bonus, "refund": refund}
+            refund = cents(db.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM activity WHERE user_id = ? AND market_id = ? AND kind = 'refund'",
+                (uid, r["market_id"])
+            ).fetchone()[0])
+        item = {"r": r, "b": b, "price": price, "value": value, "bonus": bonus, "refund": refund}
         (active if b["m"]["status"] == "open" else settled).append(item)
     settled.sort(key=lambda i: i["b"]["m"]["resolved_at"] or "", reverse=True)
     trades = db.execute(
@@ -3278,17 +3352,22 @@ def seize_position(db, loan_id, lender_id, outcome_id, mode):
         idx = [x["id"] for x in outs].index(outcome_id)
         q = [x["shares"] for x in outs]
         n, coins = shares_to_cover(q, m["b"], idx, pos["shares"], loan["owed"])
+        n_centi = min(lmsr.to_centi_shares(pos["shares"]), max(1, math.ceil(n * lmsr.SHARES_SCALE - 1e-9)))
+        n = lmsr.from_centi_shares(n_centi)
+        coins = lmsr.from_cents(lmsr.quote_sell_cents([lmsr.to_centi_shares(x) for x in q], m["b"], idx, n_centi))
         if coins < 0.01:
             raise TradeError("That bet is worth less than Ⓜ0.01.")
         names = {r["id"]: r["username"] for r in db.execute(
             "SELECT id, username FROM users WHERE id IN (?, ?)", (borrower_id, lender_id))}
         label = o["label"]
-        new_shares = pos["shares"] - n
-        new_cost = pos["cost"] * (new_shares / pos["shares"])
+        new_shares = lmsr.from_centi_shares(lmsr.to_centi_shares(pos["shares"]) - n_centi)
+        new_cost = pos["cost"] * (new_shares / pos["shares"]) if pos["shares"] > 0 else 0.0
         if mode == "sell":
-            db.execute("UPDATE outcomes SET shares = shares - ? WHERE id = ?", (n, outcome_id))
+            new_outcome_shares = lmsr.from_centi_shares(lmsr.to_centi_shares(outs[idx]["shares"]) - n_centi)
+            db.execute("UPDATE outcomes SET shares = ? WHERE id = ?", (new_outcome_shares, outcome_id))
             set_position(db, borrower_id, outcome_id, new_shares, new_cost)
             db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (coins, borrower_id))
+            db.execute("UPDATE markets SET pot_cents = pot_cents - ? WHERE id = ?", (lmsr.to_cents(coins), m["id"]))
             log_activity(db, borrower_id, "sell", coins, m,
                          f"Forced sale of {n:,.2f} shares of “{label}” to repay {names[lender_id]}")
             db.execute("INSERT INTO trades (user_id, market_id, outcome_id, shares, amount, created_at) "
@@ -3302,19 +3381,6 @@ def seize_position(db, loan_id, lender_id, outcome_id, mode):
                 raise TradeError(block)
             if late_multiplier(m) > 0:
                 raise TradeError("Betting in this market is about to close, so you can only force a sale here.")
-            fee = entry_fee_due(db, m, lender_id)
-            if fee:
-                cash = db.execute("SELECT balance FROM users WHERE id = ?", (lender_id,)).fetchone()["balance"]
-                if cash + EPS < fee:
-                    raise TradeError(f"Taking over a first bet in this market costs the Ⓜ{fee:,.0f} entry fee "
-                                     f"and you have Ⓜ{cash:,.2f}.")
-                creator = creator_name(db, m)
-                db.execute("UPDATE users SET balance = ROUND(balance - ?, 2) WHERE id = ?", (fee, lender_id))
-                log_activity(db, lender_id, "fee", -fee, m, f"Entry fee (first bet), paid to {creator}")
-                db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (fee, m["created_by"]))
-                log_activity(db, m["created_by"], "earning", fee, m, f"Entry fee from {names[lender_id]}")
-                db.execute("INSERT INTO market_entries (market_id, user_id, creator_id, fee, created_at) "
-                           "VALUES (?, ?, ?, ?, ?)", (m["id"], lender_id, m["created_by"], fee, now_str()))
             mine = db.execute("SELECT * FROM positions WHERE user_id = ? AND outcome_id = ?",
                               (lender_id, outcome_id)).fetchone()
             set_position(db, borrower_id, outcome_id, new_shares, new_cost)
@@ -3758,9 +3824,8 @@ def get_setting(db, key):
 @admin_required
 def admin():
     db = get_db()
-    markets = [bundle(db, m) for m in db.execute("SELECT * FROM markets WHERE status = 'open' ORDER BY closes_at")]
-    settled = [bundle(db, m) for m in db.execute(
-        "SELECT * FROM markets WHERE status != 'open' ORDER BY resolved_at DESC")]
+    markets = bundle_many(db, db.execute("SELECT * FROM markets WHERE status = 'open' ORDER BY closes_at").fetchall())
+    settled = bundle_many(db, db.execute("SELECT * FROM markets WHERE status != 'open' ORDER BY resolved_at DESC").fetchall())
     users, user_view = list_users(db)
     proposals =[dict(p, outcomes=json.loads(p["outcomes"])) for p in db.execute(
         "SELECT p.*, u.username FROM proposals p JOIN users u ON u.id = p.user_id "
@@ -3848,9 +3913,8 @@ def admin_create():
         pick, stake, error = read_stake(request.form, fields["labels"])
     if not error:
         error = overdue_block(get_db(), g.user["id"])
-    if not error and g.user["balance"] + EPS < CREATION_FEE + stake:
-        error = (f"You need Ⓜ{CREATION_FEE + stake:,.2f} (Ⓜ{CREATION_FEE:,.0f} fee + Ⓜ{stake:,.2f} opening bet) "
-                 f"but have Ⓜ{g.user['balance']:,.2f}.")
+    if not error and g.user["balance"] + EPS < stake:
+        error = f"You need Ⓜ{stake:,.2f} for your opening bet, but have Ⓜ{g.user['balance']:,.2f}."
     if error:
         flash(error, "error")
         return redirect(url_for("admin"))
@@ -3859,7 +3923,7 @@ def admin_create():
         mid = create_market(db, fields["question"], fields["description"], fields["category"],
                             fields["closes_at"], fields["labels"], fields["b"], g.user["id"],
                             fields["rules_source"], fields["rules_otherwise"], fields["ou_line"], fields["ou_unit"],
-                            charge_fee=True)
+                            charge_fee=False)
     except TradeError as e:
         flash(str(e), "error")
         return redirect(url_for("admin"))
@@ -3870,8 +3934,7 @@ def admin_create():
         flash(f"Market created, but your opening bet failed: {e}", "error")
         return redirect(url_for("market", mid=mid))
     log_audit("market.create", "market", mid, fields["question"])
-    flash(f"Market created. You paid the Ⓜ{CREATION_FEE:,.0f} creation fee and bet Ⓜ{stake:,.2f} on "
-          f"“{fields['labels'][pick]}”.", "success")
+    flash(f"Market created with a Ⓜ{stake:,.2f} opening bet on “{fields['labels'][pick]}”.", "success")
     return redirect(url_for("market", mid=mid))
 
 
@@ -3896,30 +3959,26 @@ def propose():
             pick, stake, error = read_stake(request.form, fields["labels"])
         if not error:
             error = overdue_block(db, g.user["id"])
-        if not error and g.user["balance"] + EPS < CREATION_FEE + stake:
-            error = (f"Proposing costs Ⓜ{CREATION_FEE:,.0f} plus your Ⓜ{stake:,.2f} opening bet "
-                     f"(Ⓜ{CREATION_FEE + stake:,.2f} total). You have Ⓜ{g.user['balance']:,.2f}.")
+        if not error and g.user["balance"] + EPS < stake:
+            error = f"Proposing requires a Ⓜ{stake:,.2f} opening bet, and you have Ⓜ{g.user['balance']:,.2f}."
         if error:
             flash(error, "error")
             return render_template("propose.html", form=request.form, mine=my_proposals(db))
         db.execute("BEGIN IMMEDIATE")
         try:
             charged = db.execute("UPDATE users SET balance = ROUND(balance - ?, 2) WHERE id = ? AND balance >= ?",
-                                 (CREATION_FEE + stake, g.user["id"], CREATION_FEE + stake - EPS)).rowcount
+                                 (stake, g.user["id"], stake - EPS)).rowcount
             if not charged:
-                raise TradeError(f"Proposing costs Ⓜ{CREATION_FEE + stake:,.2f} including your opening bet.")
-            db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (stake, g.user["id"]))
-            log_activity(db, g.user["id"], "fee", -CREATION_FEE, None, f"Market proposal fee: “{fields['question']}”")
-            db.execute("UPDATE users SET balance = ROUND(balance - ?, 2) WHERE id = ?", (stake, g.user["id"]))
+                raise TradeError(f"Proposing requires a Ⓜ{stake:,.2f} opening bet.")
             log_activity(db, g.user["id"], "stake", -stake, None,
                          f"Opening bet held: Ⓜ{stake:,.2f} on “{fields['labels'][pick]}” for “{fields['question']}”")
             db.execute(
                 "INSERT INTO proposals (user_id, question, description, category, outcomes, closes_at, created_at, "
                 "rules_source, rules_otherwise, ou_line, ou_unit, fee, stake, stake_pick, stake_label) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, ?)",
                 (g.user["id"], fields["question"], fields["description"], fields["category"],
                  json.dumps(fields["labels"]), fields["closes_at"], now_str(),
-                 fields["rules_source"], fields["rules_otherwise"], fields["ou_line"], fields["ou_unit"], CREATION_FEE,
+                 fields["rules_source"], fields["rules_otherwise"], fields["ou_line"], fields["ou_unit"],
                  stake, pick, fields["labels"][pick]))
             db.execute("COMMIT")
         except TradeError as e:
@@ -3929,8 +3988,8 @@ def propose():
         except Exception:
             db.execute("ROLLBACK")
             raise
-        flash(f"Thanks! Your market was sent to the admins for approval. You paid the Ⓜ{CREATION_FEE:,.0f} fee, "
-              f"and your Ⓜ{stake:,.2f} opening bet is held until it's approved.", "success")
+        flash(f"Thanks! Your market was sent to the admins for approval, and your Ⓜ{stake:,.2f} opening bet "
+              f"is held until it's approved.", "success")
         return redirect(url_for("propose"))
     return render_template("propose.html", form={}, mine=my_proposals(db))
 
@@ -4004,8 +4063,8 @@ def admin_review(pid):
             db.execute("COMMIT")
             if done:
                 log_audit("proposal.reject", "proposal", pid, p["question"], note)
-            flash("Proposal rejected." + (f" {p['username']}'s Ⓜ{p['stake']:,.2f} opening bet was refunded; "
-                                          f"the Ⓜ{p['fee']:,.0f} fee is kept." if done and p["stake"] else ""),
+            flash("Proposal rejected." + (f" {p['username']}'s Ⓜ{p['stake']:,.2f} opening bet was refunded."
+                                          if done and p["stake"] else ""),
                   "success")
             return redirect(url_for("admin") + "#proposals")
         fields, error = read_market_form(request.form)

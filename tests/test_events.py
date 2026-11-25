@@ -284,7 +284,8 @@ def test_logging_is_set_up_once_and_writes_a_rotating_file(tmp_path):
         h.flush()
     text = (tmp_path / "logs" / "mams.log").read_text()
     assert "hello from the test" in text and "[-]" in text
-    assert os.stat(tmp_path / "logs" / "mams.log").st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert os.stat(tmp_path / "logs" / "mams.log").st_mode & 0o777 == 0o600
     assert any(isinstance(h, logging.handlers.RotatingFileHandler) for h in lg.handlers)
 
 
