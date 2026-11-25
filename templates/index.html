@@ -35,7 +35,7 @@
           {{ status_pill(b) }}
         </div>
         <h2><a href="{{ url_for('market', mid=b.m.id) }}">{{ b.m.question }}</a></h2>
-        {% if b.ou %}<div class="ou-line">Over / Under {{ b.ou.text }}</div>{% endif %}
+        {% if b.ou %}<div class="ou-line">Over / Under {{ b.ou.text }}{% if b.stock %} · {{ b.stock.ticker }} close{% endif %}</div>{% endif %}
         {% if b.binary %}
           <div class="chance"><span class="chance-pct" data-count>{{ b.outcomes[0].price|pct }}</span>
             <span class="muted">chance of {{ b.outcomes[0].label if b.ou else 'Yes' }}</span> {{ delta(b.trend, 0) }}</div>
@@ -108,7 +108,7 @@
         {{ status_pill(b) }}
       </div>
       <h3><a class="stretch" href="{{ url_for('market', mid=b.m.id) }}">{{ b.m.question }}</a></h3>
-      {% if b.ou %}<div class="ou-line">Over / Under {{ b.ou.text }}{% if b.ou.result %} · Result: {{ b.ou.result }}{% endif %}</div>{% endif %}
+      {% if b.ou %}<div class="ou-line">Over / Under {{ b.ou.text }}{% if b.stock %} · {{ b.stock.ticker }} close{% endif %}{% if b.ou.result %} · Result: {{ b.ou.result }}{% endif %}</div>{% endif %}
       {% if b.binary and live %}
         <div class="card-chance">
           <div class="chance">

@@ -24,6 +24,20 @@
            {{ 'disabled' if kind != 'overunder' }}>
   </label>
 </div>
+<div data-stock-only {{ 'hidden' if kind != 'overunder' or form.category != 'Stocks' }}>
+  <div class="row">
+    <label class="field"><span>Stock ticker</span>
+      <input name="stock_ticker" maxlength="15" value="{{ form.stock_ticker or '' }}" placeholder="AAPL"
+             autocapitalize="characters" {{ 'required' if kind == 'overunder' and form.category == 'Stocks' else 'disabled' }}>
+    </label>
+    <label class="field"><span>Closing price on <em class="muted">(optional)</em></span>
+      <input type="date" name="stock_date" value="{{ form.stock_date or '' }}"
+             {{ '' if kind == 'overunder' and form.category == 'Stocks' else 'disabled' }}>
+    </label>
+  </div>
+  <p class="muted small">Stocks over/unders resolve themselves: Over wins if the stock's official close is above the line.
+    The price date defaults to the day betting closes (the next day if betting closes after 4:00 pm).</p>
+</div>
 <p class="muted small" data-ou-only {{ 'hidden' if kind != 'overunder' }}>People bet whether the real number will be
   over or under the line. Tip: a line ending in .5 (like 50.5) can't be hit exactly, so there's never a tie.</p>
 <label class="field"><span data-rules-label>{{ rules_labels[kind] }}</span>

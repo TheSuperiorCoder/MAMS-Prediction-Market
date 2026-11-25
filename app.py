@@ -83,7 +83,10 @@ LATE_FEE_TIERS = [  # (less than this much time left, T), checked in order
 ]  # more than 2 hours left: T = 0, no fee. Keep these sorted from shortest to longest.
 
 
-CATEGORIES = ["Academics", "Competitions", "Sports", "Events", "Campus Life", "Weather", "Other"]
+CATEGORIES = ["Academics", "Competitions", "Sports", "Events", "Campus Life", "Weather", "Stocks", "Other"]
+# Over/Under markets in Stocks with a ticker resolve themselves from the closing price (see "stock over/unders").
+# MAMS_STOCK_AUTO=0 turns the automatic price checks off.
+STOCK_AUTO = os.environ.get("MAMS_STOCK_AUTO", "1") != "0"
 EPS = 1e-9
 # Player loans: lenders pick the amount, a flat interest rate (percent of the amount) and how many days until it's due.
 LOAN_MIN = 1.0
@@ -296,13 +299,18 @@ NEW_COLUMNS = {
                 ("ou_line", "REAL"), ("ou_unit", "TEXT NOT NULL DEFAULT ''"), ("ou_result", "REAL"),
                 ("featured", "INTEGER NOT NULL DEFAULT 0"),
                 # money left in the pot after paying Ⓜ1 per winning share, shared out among the winners
-                ("leftover_paid", "REAL NOT NULL DEFAULT 0")],
+                ("leftover_paid", "REAL NOT NULL DEFAULT 0"),
+                # Stocks over/unders: the ticker and the date whose close settles it; stock_status is '' while
+                # the checker is watching, else push | error | manual (handed to the admins); stock_note says why.
+                ("stock_ticker", "TEXT"), ("stock_date", "TEXT"),
+                ("stock_status", "TEXT NOT NULL DEFAULT ''"), ("stock_note", "TEXT NOT NULL DEFAULT ''")],
     "proposals": [("rules_source", "TEXT NOT NULL DEFAULT ''"), ("rules_otherwise", "TEXT NOT NULL DEFAULT ''"),
                   ("ou_line", "REAL"), ("ou_unit", "TEXT NOT NULL DEFAULT ''"),
                   ("fee", "REAL NOT NULL DEFAULT 0"),  # creation fee paid, refunded on withdrawal
                   # the proposer's opening bet, held until approval (refunded if rejected or withdrawn)
                   ("stake", "REAL NOT NULL DEFAULT 0"), ("stake_pick", "INTEGER"),
-                  ("stake_label", "TEXT NOT NULL DEFAULT ''")],
+                  ("stake_label", "TEXT NOT NULL DEFAULT ''"),
+                  ("stock_ticker", "TEXT"), ("stock_date", "TEXT")],
     # via: 'loan' marks shares handed from a borrower to their lender to pay off an overdue loan
     "trades": [("via", "TEXT")],
     # min_score: an offer only borrowers with at least this credit score may take
@@ -685,6 +693,294 @@ def parse_ou(f):
     return line, f.get("ou_unit", "").strip()[:15], None
 
 
+# ---------------------------------------------------------------- stock over/unders
+# Over/Under markets in the Stocks category with a ticker settle themselves: once betting has closed and the price
+# date's official close is in, the result is proposed automatically (Over if the close is above the line) and then
+# finalizes after the usual challenge window, so traders can still dispute a bad price. A close exactly on the line,
+# an unknown ticker, or an admin withdrawing the automatic result hands the market back to the admins.
+
+STOCK_CATEGORY = "Stocks"
+TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-=^]{0,14}$")
+STOCK_CHECK_EVERY = 300  # seconds between looks for stock markets that are ready to settle
+STOCK_PRICE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?{query}"
+_stock_lock = threading.Lock()
+_stock_last_check = 0.0
+
+
+class StockNotFound(Exception):
+    """The price source has never heard of this ticker."""
+
+
+class StockFetchError(Exception):
+    """The price source couldn't be reached or sent something unreadable. Try again later."""
+
+
+def _epoch_day(seconds):
+    """The calendar date `seconds` after the Unix epoch (already shifted to the exchange's time zone)."""
+    return (datetime(1970, 1, 1) + timedelta(seconds=seconds)).date()
+
+
+def fetch_stock_closes(ticker, start, end):
+    """Daily closing prices for `ticker` from `start` to `end` (dates, inclusive) as a list of
+    (date, close, final) in date order. `final` is False for a day whose trading session hasn't ended yet (its
+    "close" is only the latest price). Raises StockNotFound or StockFetchError."""
+    period1 = int(datetime.combine(start - timedelta(days=1), datetime.min.time()).timestamp())
+    period2 = int(datetime.combine(end + timedelta(days=2), datetime.min.time()).timestamp())
+    url = STOCK_PRICE_URL.format(ticker=urllib.request.quote(ticker, safe=""),
+                                 query=urlencode({"period1": period1, "period2": period2, "interval": "1d",
+                                                  "includePrePost": "false"}))
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
+                                    timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise StockNotFound(ticker)
+        raise StockFetchError(f"price source answered {e.code}")
+    except (OSError, ValueError) as e:
+        raise StockFetchError(str(e) or e.__class__.__name__)
+    try:
+        result = (data.get("chart") or {}).get("result") or []
+        if not result:
+            raise StockNotFound(ticker)
+        r = result[0]
+        off = int(r["meta"].get("gmtoffset") or 0)
+        regular = (r["meta"].get("currentTradingPeriod") or {}).get("regular") or {}
+        session_end = int(regular.get("end") or 0)
+        closes = ((r.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+        stamps = r.get("timestamp") or []
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+        raise StockFetchError("unreadable price data")
+    now = time.time()
+    today = _epoch_day(now + off)  # the exchange's own date
+    session_day = _epoch_day(session_end + off) if session_end else None
+    bars = []
+    for ts, close in zip(stamps, closes):
+        if close is None:
+            continue
+        day = _epoch_day(ts + off)
+        if not start <= day <= end:
+            continue
+        # A past day is settled. Today's bar only is once the regular session has been over for half an hour.
+        final = day < today or (day == session_day and now >= session_end + 1800)
+        bars.append((day, round(float(close), 2), final))
+    return bars
+
+
+def parse_ticker(text):
+    """'$aapl ' -> 'AAPL'. Returns None if it doesn't look like a ticker."""
+    t = (text or "").strip().upper().lstrip("$")
+    return t if TICKER_RE.match(t) else None
+
+
+def guess_ticker(question):
+    """A likely ticker in a question ('$AAPL', '(TSLA)', 'NVDA stock'), to prefill the Stocks form."""
+    m = (re.search(r"\$([A-Za-z]{1,5}(?:\.[A-Za-z])?)\b", question or "")
+         or re.search(r"\(([A-Z]{1,5}(?:\.[A-Z])?)\)", question or "")
+         or re.search(r"\b([A-Z]{2,5})\b(?= (?:stock|shares|close))", question or ""))
+    return m.group(1).upper() if m else ""
+
+
+STOCK_SESSION_END = (16, 0)  # 4:00 pm school time (New York), when US exchanges close
+
+
+def earliest_price_date(closes_at):
+    """The first date whose close is still unknown when betting stops: the closing day if betting stops by 4 pm,
+    otherwise the day after."""
+    return closes_at.date() + timedelta(days=0 if (closes_at.hour, closes_at.minute) <= STOCK_SESSION_END else 1)
+
+
+PRICE_DATE_TOO_EARLY = ("Betting has to close before that day's closing price is known: pick a later price date, or "
+                        "close betting by 4:00 pm on the price date.")
+
+
+def read_stock_fields(f, closes_at):
+    """The ticker and price date from a form, for a market whose betting closes at `closes_at` (datetime).
+    The price date defaults to the first day whose close is unknown when betting stops and can't be earlier, or
+    people could bet on a price they already know. Returns (ticker, date_str, error)."""
+    ticker = parse_ticker(f.get("stock_ticker"))
+    if ticker is None:
+        return None, None, "Enter the stock's ticker symbol, like AAPL or BRK-B."
+    raw = (f.get("stock_date") or "").strip()
+    try:
+        day = date.fromisoformat(raw) if raw else earliest_price_date(closes_at)
+    except ValueError:
+        return None, None, "Pick the date whose closing price settles the market."
+    if day < earliest_price_date(closes_at):
+        return None, None, PRICE_DATE_TOO_EARLY
+    if day > closes_at.date() + timedelta(days=366):
+        return None, None, "Pick a price date within a year of betting closing."
+    return ticker, day.isoformat(), None
+
+
+def check_ticker(ticker):
+    """None if the ticker is known (or the price source can't be reached right now), else an error message."""
+    try:
+        fetch_stock_closes(ticker, date.today() - timedelta(days=10), date.today())
+    except StockNotFound:
+        return f"The price source doesn't know the ticker {ticker}. Check the symbol (e.g. BRK-B, not BRK.B)."
+    except StockFetchError:
+        pass  # can't tell right now; the checker reports it later if it's really wrong
+    return None
+
+
+def stock_rule_text(ticker, day, line, unit):
+    """The settlement rule, as shown on the market page and in the clarification when a market moves to Stocks."""
+    text = ou_text(line, unit)
+    d = date.fromisoformat(day)
+    return (f"Resolves automatically from {ticker}'s official closing price on {d.strftime('%a %b')} {d.day}, "
+            f"{d.year} (or the next trading day's close, if the exchange is shut that day). Over wins if it closes "
+            f"above {text}, Under if below. A close of exactly {text} is a push: an admin cancels the market and "
+            f"everyone is refunded. The result is proposed automatically and can be disputed as usual.")
+
+
+STOCK_DUE_SQL = ("status = 'open' AND category = ? AND stock_ticker IS NOT NULL AND ou_line IS NOT NULL "
+                 "AND stock_status = '' AND proposed_outcome_id IS NULL AND closes_at <= ? AND stock_date <= ?")
+
+
+def stock_markets_due(db):
+    return db.execute(f"SELECT * FROM markets WHERE {STOCK_DUE_SQL} ORDER BY id",
+                      (STOCK_CATEGORY, now_str(), date.today().isoformat())).fetchall()
+
+
+def _stock_note(db, mid, note, status=""):
+    db.execute("UPDATE markets SET stock_note = ?, stock_status = ? WHERE id = ?", (note[:300], status, mid))
+
+
+def check_stock_markets(db, fetch=None):
+    """Propose results for stock markets whose closing price is in. Safe to run at any time and from any thread.
+    Returns how many results it proposed."""
+    fetch = fetch or fetch_stock_closes
+    proposed = 0
+    for m in stock_markets_due(db):
+        mid, ticker, day = m["id"], m["stock_ticker"], date.fromisoformat(m["stock_date"])
+        if earliest_price_date(parse_dt(m["closes_at"])) > day:  # e.g. betting was reopened past the price date
+            _stock_note(db, mid, f"Betting closed after {ticker}'s close on {day.isoformat()} was known, so people "
+                                 "could bet on a known price. Resolve it by hand, or set a later price date.", "manual")
+            continue
+        try:
+            bars = fetch(ticker, day, min(day + timedelta(days=14), date.today()))
+        except StockNotFound:
+            _stock_note(db, mid, f"The price source doesn't know {ticker}. Fix the ticker or resolve by hand.", "error")
+            log_event("stock_check_failed", detail=f"market #{mid}: unknown ticker {ticker}")
+            continue
+        except StockFetchError as e:
+            _stock_note(db, mid, f"Couldn't get {ticker}'s price yet ({e}). Will try again.")
+            continue
+        if not bars:
+            _stock_note(db, mid, f"Waiting for {ticker}'s close on {day.isoformat()} or the next trading day.")
+            continue
+        bar_day, close, final = bars[0]
+        if not final:
+            _stock_note(db, mid, f"Waiting for {ticker}'s session on {bar_day.isoformat()} to end.")
+            continue
+        line, unit = m["ou_line"], m["ou_unit"]
+        if close == line:
+            _stock_note(db, mid, f"{ticker} closed at exactly {ou_text(close, unit)} on {bar_day.isoformat()}: a "
+                                 "push. Cancel & refund the market.", "push")
+            log_event("stock_push", detail=f"market #{mid}: {ticker} closed on the line")
+            continue
+        over, under = get_outcomes(db, mid)
+        winner = over if close > line else under
+        note = f"{ticker} closed at {ou_text(close, unit)} on {bar_day.isoformat()}."
+        if auto_propose(db, mid, winner["id"], close, note):
+            proposed += 1
+            log_audit("result.propose", "market", mid, m["question"],
+                      f"Automatic: {note} Proposed “{winner['label']}”.", system=True)
+    return proposed
+
+
+def auto_propose(db, market_id, outcome_id, actual, note):
+    """Propose a stock market's result as the system (no admin), unless something changed meanwhile."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        m = db.execute(f"SELECT 1 FROM markets WHERE id = ? AND {STOCK_DUE_SQL}",
+                       (market_id, STOCK_CATEGORY, now_str(), date.today().isoformat())).fetchone()
+        if m is None:
+            db.execute("ROLLBACK")
+            return False
+        now = datetime.now()
+        db.execute("UPDATE markets SET proposed_outcome_id = ?, proposed_by = NULL, proposed_at = ?, finalizes_at = ?, "
+                   "ou_result = ?, stock_note = ? WHERE id = ?",
+                   (outcome_id, now.strftime("%Y-%m-%d %H:%M:%S"),
+                    (now + DISPUTE_WINDOW).strftime("%Y-%m-%d %H:%M:%S"), actual, note, market_id))
+        db.execute("UPDATE disputes SET handled_at = ? WHERE market_id = ? AND handled_at IS NULL",
+                   (now_str(), market_id))
+        db.execute("COMMIT")
+        return True
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def _run_stock_check():
+    try:
+        with app.app_context():
+            check_stock_markets(get_db())
+    except Exception:
+        log.exception("stock market check failed")
+
+
+def maybe_check_stocks(db):
+    """Called on each request. At most every STOCK_CHECK_EVERY seconds, and only when a stock market is ready,
+    fetch prices on a background thread so no visitor waits on the price source."""
+    global _stock_last_check
+    now = time.time()
+    if now - _stock_last_check < STOCK_CHECK_EVERY or not STOCK_AUTO:
+        return
+    with _stock_lock:
+        if now - _stock_last_check < STOCK_CHECK_EVERY:
+            return
+        _stock_last_check = now
+    if db.execute(f"SELECT 1 FROM markets WHERE {STOCK_DUE_SQL} LIMIT 1",
+                  (STOCK_CATEGORY, now_str(), date.today().isoformat())).fetchone():
+        threading.Thread(target=_run_stock_check, name="stock-check", daemon=True).start()
+
+
+def set_stock_market(db, market_id, ticker, day, admin_id):
+    """Move an Over/Under market to Stocks so it resolves itself (or update its ticker/date). Posts a dated
+    clarification with the new rule, since it changes how the market settles."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        m = db.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
+        if m is None or m["status"] != "open" or m["proposed_outcome_id"] is not None:
+            raise TradeError("Only open markets without a proposed result can move to Stocks.")
+        if m["ou_line"] is None:
+            raise TradeError("Only Over/Under markets can resolve from a stock price. Convert it to Over/Under first.")
+        if date.fromisoformat(day) < earliest_price_date(parse_dt(m["closes_at"])):
+            raise TradeError(PRICE_DATE_TOO_EARLY)
+        db.execute("UPDATE markets SET category = ?, stock_ticker = ?, stock_date = ?, stock_status = '', "
+                   "stock_note = '' WHERE id = ?", (STOCK_CATEGORY, ticker, day, market_id))
+        verb = "Updated" if m["stock_ticker"] else "Moved to Stocks"
+        db.execute("INSERT INTO clarifications (market_id, admin_id, body, created_at) VALUES (?, ?, ?, ?)",
+                   (market_id, admin_id, f"{verb}: " + stock_rule_text(ticker, day, m["ou_line"], m["ou_unit"]),
+                    now_str()))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def stop_stock_market(db, market_id, admin_id):
+    """Stop a market resolving itself; admins resolve it by hand. It stays in the Stocks category."""
+    m = db.execute("SELECT * FROM markets WHERE id = ?", (market_id,)).fetchone()
+    if m is None or m["stock_ticker"] is None:
+        raise TradeError("This market doesn't resolve from a stock price.")
+    if m["status"] != "open":
+        raise TradeError("This market is already settled.")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("UPDATE markets SET stock_ticker = NULL, stock_date = NULL, stock_status = '', stock_note = '' "
+                   "WHERE id = ?", (market_id,))
+        db.execute("INSERT INTO clarifications (market_id, admin_id, body, created_at) VALUES (?, ?, ?, ?)",
+                   (market_id, admin_id, f"This market no longer resolves automatically from {m['stock_ticker']}'s "
+                                         "price. An admin will propose the result.", now_str()))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
 def open_disputes(db, market_id):
     return db.execute("SELECT d.*, u.username FROM disputes d JOIN users u ON u.id = d.user_id "
                       "WHERE d.market_id = ? AND d.handled_at IS NULL ORDER BY d.id", (market_id,)).fetchall()
@@ -710,6 +1006,10 @@ def _build_bundle(m, outs, stats, has_dispute):
         "ou": ({"text": ou_text(m["ou_line"], m["ou_unit"]),
                 "result": None if m["ou_result"] is None else ou_text(m["ou_result"], m["ou_unit"])}
                if m["ou_line"] is not None else None),
+        # set when the market resolves itself from a stock's closing price
+        "stock": ({"ticker": m["stock_ticker"], "date": m["stock_date"],
+                   "rule": stock_rule_text(m["stock_ticker"], m["stock_date"], m["ou_line"], m["ou_unit"])}
+                  if m["stock_ticker"] and m["ou_line"] is not None and m["category"] == STOCK_CATEGORY else None),
         "outcomes": [{"id": o["id"], "label": o["label"], "shares": o["shares"], "price": p}
                      for o, p in zip(outs, ps)],
         "volume": stats["volume"] if stats else 0,
@@ -1349,6 +1649,9 @@ def retract_result(db, market_id):
             raise TradeError("There's no proposed result to withdraw.")
         db.execute("UPDATE markets SET proposed_outcome_id = NULL, proposed_by = NULL, proposed_at = NULL, "
                    "finalizes_at = NULL, ou_result = NULL WHERE id = ?", (market_id,))
+        if m["stock_ticker"]:  # don't let the stock checker propose the same thing straight back
+            db.execute("UPDATE markets SET stock_status = 'manual', stock_note = ? WHERE id = ?",
+                       ("The proposed result was withdrawn, so an admin resolves this one by hand.", market_id))
         db.execute("UPDATE disputes SET handled_at = ? WHERE market_id = ? AND handled_at IS NULL",
                    (now_str(), market_id))
         db.execute("COMMIT")
@@ -1440,7 +1743,8 @@ def delete_market(db, market_id):
 
 
 def create_market(db, question, description, category, closes_at, labels, b, created_by=None,
-                  rules_source="", rules_otherwise="", ou_line=None, ou_unit="", charge_fee=False):
+                  rules_source="", rules_otherwise="", ou_line=None, ou_unit="", charge_fee=False,
+                  stock_ticker=None, stock_date=None):
     db.execute("BEGIN IMMEDIATE")
     try:
         if charge_fee:  # an admin making a market directly pays the same fee as a proposer
@@ -1451,9 +1755,10 @@ def create_market(db, question, description, category, closes_at, labels, b, cre
             log_activity(db, created_by, "fee", -CREATION_FEE, None, f"Market creation fee: “{question}”")
         cur = db.execute(
             "INSERT INTO markets (question, description, category, b, closes_at, created_by, created_at, "
-            "rules_source, rules_otherwise, ou_line, ou_unit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "rules_source, rules_otherwise, ou_line, ou_unit, stock_ticker, stock_date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (question, description, category, b, closes_at, created_by, now_str(), rules_source, rules_otherwise,
-             ou_line, ou_unit or ""))
+             ou_line, ou_unit or "", stock_ticker, stock_date))
         mid = cur.lastrowid
         for i, label in enumerate(labels):
             db.execute("INSERT INTO outcomes (market_id, label, position) VALUES (?, ?, ?)", (mid, label, i))
@@ -1492,6 +1797,7 @@ def load_user_and_check_csrf():
     if request.endpoint not in PWA_ENDPOINTS:
         finalize_due(get_db())
         collect_overdue_loans(get_db())
+        maybe_check_stocks(get_db())
     if request.method == "POST":
         token = request.form.get("csrf_token", "")
         if not token or not secrets.compare_digest(token, session.get("_csrf", "")):
@@ -1783,6 +2089,8 @@ AUDIT_ACTIONS = {
     "market.unfeature": "Removed a market from featured",
     "market.clarify": "Added a rules clarification",
     "market.convert_ou": "Converted a market to Over/Under",
+    "market.stock": "Set a market to resolve from a stock price",
+    "market.stock_off": "Stopped a market resolving from a stock price",
     "market.block": "Blocked a user from a market",
     "market.unblock": "Unblocked a user from a market",
     "market.cancel_trade": "Cancelled and refunded a share purchase",
@@ -2611,7 +2919,9 @@ def market(mid):
                            blocked=blocked, all_users=all_users, clarifications=clarifications,
                            disputes=disputes, proposer=proposer, can_dispute=can_dispute,
                            commenting_off=commenting_off, comments_off_text=COMMENTS_OFF,
-                           reopen_default=(datetime.now() + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M"))
+                           reopen_default=(datetime.now() + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M"),
+                           stock_ticker_default=m["stock_ticker"] or guess_ticker(m["question"]),
+                           stock_date_default=m["stock_date"] or earliest_price_date(parse_dt(m["closes_at"])).isoformat())
 
 
 @app.post("/market/<int:mid>/dispute")
@@ -3966,17 +4276,25 @@ def read_market_form(f):
                       f"(at least {MIN_RULES_LENGTH} characters in the first rules box).")
     if closes_at is None or closes_at <= datetime.now():
         return None, "Pick a closing time in the future."
+    category = f.get("category") if f.get("category") in CATEGORIES else "Other"
+    stock_ticker = stock_date = None
+    if category == STOCK_CATEGORY and kind == "overunder":  # these settle themselves from the closing price
+        stock_ticker, stock_date, error = read_stock_fields(f, closes_at)
+        if error:
+            return None, error
     return {
         "question": question,
         "description": description[:2000],
         "rules_source": f.get("rules_source", "").strip()[:300],
         "rules_otherwise": f.get("rules_otherwise", "").strip()[:1000],
-        "category": f.get("category") if f.get("category") in CATEGORIES else "Other",
+        "category": category,
         "closes_at": closes_at.strftime("%Y-%m-%d %H:%M:%S"),
         "labels": labels,
         "b": market_b(len(labels)),
         "ou_line": ou_line,
         "ou_unit": ou_unit,
+        "stock_ticker": stock_ticker,
+        "stock_date": stock_date,
     }, None
 
 
@@ -4024,7 +4342,7 @@ def admin_create():
         mid = create_market(db, fields["question"], fields["description"], fields["category"],
                             fields["closes_at"], fields["labels"], fields["b"], g.user["id"],
                             fields["rules_source"], fields["rules_otherwise"], fields["ou_line"], fields["ou_unit"],
-                            charge_fee=True)
+                            charge_fee=True, stock_ticker=fields["stock_ticker"], stock_date=fields["stock_date"])
     except TradeError as e:
         flash(str(e), "error")
         return redirect(url_for("admin"))
@@ -4080,12 +4398,12 @@ def propose():
                          f"Opening bet held: Ⓜ{stake:,.2f} on “{fields['labels'][pick]}” for “{fields['question']}”")
             db.execute(
                 "INSERT INTO proposals (user_id, question, description, category, outcomes, closes_at, created_at, "
-                "rules_source, rules_otherwise, ou_line, ou_unit, fee, stake, stake_pick, stake_label) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "rules_source, rules_otherwise, ou_line, ou_unit, fee, stake, stake_pick, stake_label, "
+                "stock_ticker, stock_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (g.user["id"], fields["question"], fields["description"], fields["category"],
                  json.dumps(fields["labels"]), fields["closes_at"], now_str(),
                  fields["rules_source"], fields["rules_otherwise"], fields["ou_line"], fields["ou_unit"], CREATION_FEE,
-                 stake, pick, fields["labels"][pick]))
+                 stake, pick, fields["labels"][pick], fields["stock_ticker"], fields["stock_date"]))
             db.execute("COMMIT")
         except TradeError as e:
             db.execute("ROLLBACK")
@@ -4191,7 +4509,8 @@ def admin_review(pid):
             return redirect(url_for("admin"))
         mid = create_market(db, fields["question"], fields["description"], fields["category"],
                             fields["closes_at"], fields["labels"], fields["b"], p["user_id"],
-                            fields["rules_source"], fields["rules_otherwise"], fields["ou_line"], fields["ou_unit"])
+                            fields["rules_source"], fields["rules_otherwise"], fields["ou_line"], fields["ou_unit"],
+                            stock_ticker=fields["stock_ticker"], stock_date=fields["stock_date"])
         db.execute("UPDATE proposals SET market_id = ? WHERE id = ?", (mid, pid))
         bet_note = ""
         if p["stake"] > 0:
@@ -4213,7 +4532,8 @@ def admin_review(pid):
             "outcomes": "\n".join(json.loads(p["outcomes"])),
             "closes_at": parse_dt(p["closes_at"]).strftime("%Y-%m-%dT%H:%M")}
     if p["ou_line"] is not None:
-        form.update(kind="overunder", ou_line=fmt_number(p["ou_line"]).replace(",", ""), ou_unit=p["ou_unit"])
+        form.update(kind="overunder", ou_line=fmt_number(p["ou_line"]).replace(",", ""), ou_unit=p["ou_unit"],
+                    stock_ticker=p["stock_ticker"] or "", stock_date=p["stock_date"] or "")
     return render_template("review_proposal.html", p=p, form=form)
 
 
@@ -4306,6 +4626,33 @@ def admin_convert_ou(mid):
         except TradeError as e:
             flash(str(e), "error")
     return redirect(url_for("market", mid=mid))
+
+
+@app.post("/admin/markets/<int:mid>/stock")
+@admin_required
+def admin_stock(mid):
+    """Move an Over/Under market to Stocks so it resolves from a closing price, update its ticker/date, or stop."""
+    db = get_db()
+    m = db.execute("SELECT * FROM markets WHERE id = ?", (mid,)).fetchone()
+    if m is None:
+        abort(404)
+    try:
+        if request.form.get("decision") == "off":
+            stop_stock_market(db, mid, g.user["id"])
+            log_audit("market.stock_off", "market", mid, m["question"], f"Was {m['stock_ticker']}.")
+            flash("This market no longer resolves itself. Propose its result by hand.", "success")
+        else:
+            ticker, day, error = read_stock_fields(request.form, parse_dt(m["closes_at"]))
+            error = error or check_ticker(ticker)
+            if error:
+                raise TradeError(error)
+            set_stock_market(db, mid, ticker, day, g.user["id"])
+            log_audit("market.stock", "market", mid, m["question"], f"{ticker} close on {day}.")
+            flash(f"Moved to Stocks. It resolves itself from {ticker}'s close on {day}, and a clarification "
+                  "explains the change.", "success")
+    except TradeError as e:
+        flash(str(e), "error")
+    return redirect(url_for("market", mid=mid) + "#admin")
 
 
 @app.post("/admin/markets/<int:mid>/result-action")

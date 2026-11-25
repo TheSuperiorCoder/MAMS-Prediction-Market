@@ -23,6 +23,7 @@
       </div>
       <h1 class="question">{{ b.m.question }}</h1>
       {% if b.ou %}<div class="ou-line">Over / Under {{ b.ou.text }}{% if b.ou.result %} · Result: <b>{{ b.ou.result }}</b>{% endif %}</div>{% endif %}
+      {% if b.stock %}<p class="muted small stock-rule">📈 {{ b.stock.rule }}</p>{% endif %}
 
       {% if b.binary and live_prices %}
         <div class="head-chance">
@@ -276,12 +277,12 @@
         {% if b.m.proposed_at %}Proposed {{ b.m.proposed_at|when }} · finalized {{ b.m.resolved_at|when }}.{% endif %}</p>
     </div>
     {% elif b.state == 'closed' %}
-    <div class="card"><h2>Betting closed</h2><p class="muted">An admin will propose a result once it's known. You'll then have {{ DISPUTE_HOURS }} hours to dispute it before winners are paid.</p></div>
+    <div class="card"><h2>Betting closed</h2><p class="muted">{% if b.stock and not b.m.stock_status %}The result is proposed automatically once {{ b.stock.ticker }}'s closing price is in.{% else %}An admin will propose a result once it's known.{% endif %} You'll then have {{ DISPUTE_HOURS }} hours to dispute it before winners are paid.</p></div>
     {% elif b.state in ('proposed', 'disputed') %}
     <div class="card" id="proposed-result">
       <h2>Proposed result</h2>
       {% for o in b.outcomes if o.id == b.m.proposed_outcome_id %}<p class="result">{{ o.label }}</p>{% endfor %}
-      <p class="muted small">Proposed by {{ proposer or 'an admin' }} {{ b.m.proposed_at|ago }}.
+      <p class="muted small">Proposed {{ 'automatically from the closing price' if b.stock and not b.m.proposed_by else 'by ' ~ (proposer or 'an admin') }} {{ b.m.proposed_at|ago }}.
         {% if b.state == 'disputed' %}It's <b>paused</b> because someone disputed it. An admin will review.
         {% else %}Winners are paid {{ b.m.finalizes_at|when }} ({{ b.m.finalizes_at|until }}) unless someone disputes it.{% endif %}</p>
       {% for d in disputes %}
@@ -372,12 +373,46 @@
         </div>
       </details>
 
+      {% if b.ou and b.m.proposed_outcome_id is none %}
+      <details class="admin-sec" id="stocks" {{ 'open' if b.m.stock_note }}>
+        <summary>{{ 'Stock price settings' if b.stock else 'Move to Stocks (resolves itself)' }}</summary>
+        <div>
+      {% if b.stock %}
+        <p class="muted small">Resolves itself from <b>{{ b.stock.ticker }}</b>'s close on {{ b.stock.date }}.</p>
+      {% else %}
+        <p class="muted small">Moves this market to the Stocks category. Once betting closes and the closing price is in,
+          the result is proposed automatically (Over above the line, Under below) and traders get {{ DISPUTE_HOURS }}
+          hours to dispute it. A dated clarification explains the change.</p>
+      {% endif %}
+      {% if b.m.stock_note %}<p class="note small">{{ b.m.stock_note }}</p>{% endif %}
+      <form method="post" action="{{ url_for('admin_stock', mid=b.m.id) }}" class="stack"
+            data-confirm="This changes how the market settles, and everyone sees a clarification saying so." data-confirm-title="{{ 'Update the stock settings?' if b.stock else 'Move to Stocks?' }}" data-confirm-label="{{ 'Update' if b.stock else 'Move to Stocks' }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="row">
+          <label class="field"><span>Ticker</span><input name="stock_ticker" maxlength="15" required placeholder="AAPL"
+                 value="{{ stock_ticker_default }}" autocapitalize="characters"></label>
+          <label class="field"><span>Closing price on</span><input type="date" name="stock_date" required value="{{ stock_date_default }}"></label>
+        </div>
+        <p class="muted small">If the exchange is shut that day, the next trading day's close counts. Betting must close
+          before that close is known (by 4:00 pm on the day).</p>
+        <button class="btn btn-small btn-ghost">{{ 'Update' if b.stock else 'Move to Stocks' }}</button>
+      </form>
+      {% if b.m.stock_ticker %}
+      <form method="post" action="{{ url_for('admin_stock', mid=b.m.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="btn btn-small btn-ghost" name="decision" value="off">Stop resolving automatically</button>
+      </form>
+      {% endif %}
+        </div>
+      </details>
+      {% endif %}
+
       {% if b.binary and not b.ou and b.m.proposed_outcome_id is none %}
       <details class="admin-sec">
         <summary>Convert to Over / Under</summary>
         <div>
       <p class="muted small">For Yes/No questions about a number. Everyone's bets carry over, and a dated clarification
-        explains the change.</p>
+        explains the change. To have a stock market resolve itself, convert it first, then move it to Stocks.</p>
       <form method="post" action="{{ url_for('admin_convert_ou', mid=b.m.id) }}" class="stack"
             data-confirm="YES and NO bets will become the sides you picked." data-confirm-title="Convert to Over/Under?" data-confirm-label="Convert">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

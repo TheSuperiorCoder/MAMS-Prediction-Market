@@ -420,6 +420,8 @@ function setupMarketForm(form) {
   const multiOnly = form.querySelector('[data-multi-only]');
   const ouOnly = form.querySelectorAll('[data-ou-only]');
   const ouInputs = form.querySelectorAll('input[name=ou_line], input[name=ou_unit]');
+  const stockOnly = form.querySelector('[data-stock-only]');
+  const stockInputs = form.querySelectorAll('input[name=stock_ticker], input[name=stock_date]');
   const outcomes = form.querySelector('textarea[name=outcomes]');
   const rulesLabel = form.querySelector('[data-rules-label]');
   const stakePick = form.querySelector('[data-stake-pick]');
@@ -447,6 +449,12 @@ function setupMarketForm(form) {
     if (multiOnly) multiOnly.hidden = !multi;
     ouOnly.forEach(e => { e.hidden = !ou; });
     ouInputs.forEach(i => { i.disabled = !ou; });
+    // Stocks over/unders take a ticker and resolve themselves from the closing price
+    const stock = ou && field('category') === 'Stocks';
+    if (stockOnly) stockOnly.hidden = !stock;
+    stockInputs.forEach(i => { i.disabled = !stock; });
+    const tickerInput = form.querySelector('input[name=stock_ticker]');
+    if (tickerInput) tickerInput.required = stock;
     const lineInput = form.querySelector('input[name=ou_line]');
     if (lineInput) lineInput.required = ou;
     if (outcomes) {
