@@ -95,6 +95,12 @@
   </div>
 </header>
 {% if user and user.held and not user.is_admin %}<div class="announcement held-banner" role="status"><div class="wrap"><span class="ann-tag">On hold</span><span>An admin needs to review your account before you can bet, lend, comment or propose. You can still look around. This usually only takes a little while.</span></div></div>{% endif %}
+{% if promo and (not user or (promo.progress and not promo.progress.awarded)) %}{% set pr = promo.progress %}<div class="announcement promo-banner" role="status"><div class="wrap"><span class="ann-tag">Black Friday</span><span>
+  {%- if pr and pr.done %}You've qualified for the Ⓜ{{ BLACK_FRIDAY_BONUS|int }} Black Friday bonus. It's paid after midnight, as long as you don't sell your qualifying bets back.
+  {%- elif not user %}Today only: sign up, then make a market or bet Ⓜ{{ PROMO_MIN_BET|int }}+ on one, and get a one-time <b>Ⓜ{{ BLACK_FRIDAY_BONUS|int }} bonus</b>. Bets must still be held at midnight.
+  {%- elif pr.new %}Today only: make a market, or bet Ⓜ{{ PROMO_MIN_BET|int }}+ on any market, for a one-time <b>Ⓜ{{ BLACK_FRIDAY_BONUS|int }} bonus</b>. Bets must still be held at midnight; a proposed market counts once an admin approves it.
+  {%- else %}Today only: make a market, or bet Ⓜ{{ PROMO_MIN_BET|int }}+ on two different markets ({{ pr.bets }}/2 so far), for a one-time <b>Ⓜ{{ BLACK_FRIDAY_BONUS|int }} bonus</b>. Bets must still be held at midnight; a proposed market counts once an admin approves it.
+  {%- endif %}</span></div></div>{% endif %}
 {% if announcement %}<div class="announcement" role="status"><div class="wrap"><span class="ann-tag">Notice</span><span>{{ announcement }}</span></div></div>{% endif %}
 
 <main class="wrap">

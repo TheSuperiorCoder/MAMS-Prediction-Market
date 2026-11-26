@@ -48,6 +48,7 @@ DB_PATH = os.environ.get("MAMS_DB", os.path.join(INSTANCE_DIR, "mams.db"))
 STARTING_BALANCE = 1000.0
 DAILY_BONUS = 100.0
 MIN_BET = 1.0
+MAX_TRADE_VALUE = 1e9  # the largest amount (coins to spend or shares to sell) a trade or quote accepts
 CURRENCY = "MAMS Bucks"
 ADMIN_USERNAMES = {u.strip().lower() for u in os.environ.get("MAMS_ADMINS", "").split(",") if u.strip()}
 # LMSR liquidity ("b") for a yes/no market. Higher = prices swing less per bet. At 1000, on a 50/50 market:
@@ -1417,6 +1418,9 @@ def check_trade(m, outs, idx, action, value, balance=None, held=None, fee=0.0):
 
     Priced in whole cents and hundredths of a share, rounding against the trader (bought shares floored, buy cost
     rounded up, sale proceeds floored) so buying and selling back can never mint coins."""
+    # Huge amounts (1e308) overflow to infinity once scaled to cents and can't be priced; nobody holds that much.
+    if not math.isfinite(value) or value > MAX_TRADE_VALUE:
+        raise TradeError(f"Enter an amount up to {MAX_TRADE_VALUE:,.0f}.")
     q_centi = [lmsr.to_centi_shares(o["shares"]) for o in outs]
     label = outs[idx]["label"]
     t = late_multiplier(m)
@@ -1558,10 +1562,128 @@ def execute_trade(db, user_id, market_id, outcome_id, action, value, min_out=Non
                    "VALUES (?, ?, ?, ?, ?, ?)", (user_id, market_id, outcome_id, d_shares, -d_cash, now_str()))
         snapshot_prices(db, market_id, m["b"])
         db.execute("COMMIT")
-        return msg
     except Exception:
         db.execute("ROLLBACK")
         raise
+    if action == "buy":
+        try:
+            if award_black_friday(db, user_id):
+                msg += f" 🎉 Black Friday bonus: Ⓜ{BLACK_FRIDAY_BONUS:,.0f} added to your balance!"
+            elif black_friday_active():
+                u = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+                pr = black_friday_progress(db, u)
+                if pr and pr["done"] and not pr["awarded"]:
+                    msg += (f" 🎉 You've qualified for the Ⓜ{BLACK_FRIDAY_BONUS:,.0f} Black Friday bonus. It's paid "
+                            "after midnight, as long as you haven't sold these bets back.")
+        except Exception:  # a promo problem must never undo or hide a completed bet
+            log.exception("Black Friday bonus check failed for user %s", user_id)
+    return msg
+
+
+# ---------------------------------------------------------------- Black Friday promotion
+# On Black Friday (the day after the 4th Thursday of November, school time) players can earn a one-time
+# BLACK_FRIDAY_BONUS:
+#   - people who sign up that day: make a market, or bet at least PROMO_MIN_BET on one market;
+#   - everyone who signed up before: make a market, or bet at least PROMO_MIN_BET on each of two different markets.
+# The qualifying actions must happen on Black Friday. "Make a market" means one an admin made directly that day, or a
+# proposal submitted that day once it's approved. That pays at once (checked after every buy, which covers market
+# creation since every new market comes with the creator's bet), even if the approval is after Black Friday.
+# Bets count by net spend (buys minus anything sold back, including sales after midnight) and are paid when Black
+# Friday is over (settle_black_friday), so buying Ⓜ10 and selling it straight back doesn't earn anything.
+PROMOS_ON = os.environ.get("MAMS_PROMOS", "1") != "0"
+BLACK_FRIDAY_BONUS = 500.0
+PROMO_MIN_BET = 10.0
+PROMO_LATE_APPROVAL_DAYS = 30  # how long after Black Friday a proposal made that day can still earn the bonus
+_bf_settled_year = None  # the last Black Friday whose bets were settled, so requests skip the check after that
+
+
+def black_friday(year):
+    wd = date(year, 11, 1).weekday()  # Monday = 0, Thursday = 3
+    return date(year, 11, 1 + (3 - wd) % 7 + 22)
+
+
+def black_friday_active(today=None):
+    today = today or date.today()
+    return PROMOS_ON and today == black_friday(today.year)
+
+
+def black_friday_progress(db, user):
+    """Where a user stands this year: None if they can't take part (signed up after Black Friday), else a dict
+    with new (signed up that day), made (markets made), bets (markets with PROMO_MIN_BET bet), needed (bets
+    needed), done and awarded."""
+    bf = black_friday(date.today().year)
+    start, end = f"{bf} 00:00:00", f"{bf + timedelta(days=1)} 00:00:00"
+    if user["created_at"] >= end:
+        return None
+    made = db.execute(
+        "SELECT (SELECT COUNT(*) FROM markets WHERE created_by = ? AND created_at >= ? AND created_at < ?) "
+        "+ (SELECT COUNT(*) FROM proposals WHERE user_id = ? AND created_at >= ? AND created_at < ? "
+        "AND market_id IS NOT NULL)", (user["id"], start, end, user["id"], start, end)).fetchone()[0]
+    # net spend per market: buys made on Black Friday, minus sales from then on (amount is negative for a sale)
+    bets = db.execute(
+        "SELECT COUNT(*) FROM (SELECT market_id FROM trades WHERE user_id = ? AND created_at >= ? AND via IS NULL "
+        "GROUP BY market_id HAVING SUM(CASE WHEN shares > 0 AND created_at < ? THEN amount WHEN shares < 0 "
+        "THEN amount ELSE 0 END) >= ?)", (user["id"], start, end, PROMO_MIN_BET - EPS)).fetchone()[0]
+    new = user["created_at"] >= start
+    needed = 1 if new else 2
+    awarded = db.execute("SELECT 1 FROM promo_awards WHERE user_id = ? AND promo = ?",
+                         (user["id"], f"black_friday_{bf.year}")).fetchone() is not None
+    return {"new": new, "made": made, "bets": bets, "needed": needed, "done": made >= 1 or bets >= needed,
+            "awarded": awarded}
+
+
+def award_black_friday(db, user_id, final=False):
+    """Pay the Black Friday bonus if this user has earned it. Before settlement (`final` False) only making a market
+    pays; qualifying bets wait for settle_black_friday. Returns the amount paid (0 if not)."""
+    today = date.today()
+    bf = black_friday(today.year)
+    if not PROMOS_ON or not bf <= today <= bf + timedelta(days=PROMO_LATE_APPROVAL_DAYS):
+        return 0.0
+    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user is None or user["held"]:
+        return 0.0
+    progress = black_friday_progress(db, user)
+    if progress is None or progress["awarded"] or not (progress["done"] if final else progress["made"]):
+        return 0.0
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if db.execute("INSERT OR IGNORE INTO promo_awards (user_id, promo, amount, created_at) VALUES (?, ?, ?, ?)",
+                      (user_id, f"black_friday_{bf.year}", BLACK_FRIDAY_BONUS, now_str())).rowcount:
+            db.execute("UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?", (BLACK_FRIDAY_BONUS, user_id))
+            log_activity(db, user_id, "bonus", BLACK_FRIDAY_BONUS, None, "Black Friday bonus")
+            paid = BLACK_FRIDAY_BONUS
+        else:
+            paid = 0.0  # another request paid it a moment ago
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    if paid:
+        log_event("promo_awarded", user_id=user_id, username=user["username"],
+                  detail=f"Black Friday bonus Ⓜ{paid:,.0f}")
+    return paid
+
+
+def settle_black_friday(db):
+    """Once Black Friday is over, pay everyone whose bets that day still qualify. Called on each request; does the
+    work once (the first request after midnight) and is cheap after that."""
+    global _bf_settled_year
+    today = date.today()
+    bf = black_friday(today.year)
+    if not PROMOS_ON or _bf_settled_year == bf.year or not bf < today <= bf + timedelta(days=PROMO_LATE_APPROVAL_DAYS):
+        return
+    key = f"black_friday_{bf.year}_settled"
+    if db.execute("SELECT 1 FROM site_settings WHERE key = ?", (key,)).fetchone() is None:
+        start, end = f"{bf} 00:00:00", f"{bf + timedelta(days=1)} 00:00:00"
+        for r in db.execute("SELECT DISTINCT user_id FROM trades WHERE created_at >= ? AND created_at < ?",
+                            (start, end)).fetchall():
+            try:
+                award_black_friday(db, r["user_id"], final=True)
+            except Exception:
+                log.exception("Black Friday settlement failed for user %s", r["user_id"])
+        db.execute("INSERT OR IGNORE INTO site_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                   (key, now_str(), now_str()))
+    _bf_settled_year = bf.year
 
 
 def resolve_market(db, market_id, outcome_id, resolved_by=None, automatic=False):
@@ -1798,6 +1920,7 @@ def load_user_and_check_csrf():
         finalize_due(get_db())
         collect_overdue_loans(get_db())
         maybe_check_stocks(get_db())
+        settle_black_friday(get_db())
     if request.method == "POST":
         token = request.form.get("csrf_token", "")
         if not token or not secrets.compare_digest(token, session.get("_csrf", "")):
@@ -2199,7 +2322,11 @@ def inject_globals():
             "OR (status = 'active' AND borrower_id = ? AND due_at <= ?) "
             "OR (status = 'active' AND lender_id = ? AND due_at <= ?)",
             (g.user["id"], g.user["id"], now_str(), g.user["id"], grace_cutoff)).fetchone()[0]
+    promo = None
+    if black_friday_active():
+        promo = {"progress": black_friday_progress(get_db(), g.user) if g.user else None}
     return {"csrf_token": csrf_token, "user": g.user, "can_bonus": can_bonus, "pending_proposals": pending,
+            "promo": promo, "BLACK_FRIDAY_BONUS": BLACK_FRIDAY_BONUS, "PROMO_MIN_BET": PROMO_MIN_BET,
             "loan_alerts": loan_alerts,
             "SCHOOL_TZ": os.environ.get("TZ", "America/New_York"),
             "announcement": get_setting(get_db(), "announcement"),

@@ -120,3 +120,18 @@ def test_app_starts_on_a_database_with_a_running_loan_from_before_the_loan_rules
     assert r.returncode == 0, r.stderr
     check = appmod.connect().execute("SELECT value FROM site_settings WHERE key = 'loans_v2_at'").fetchone()
     assert check and check[0] != "1970-01-01 00:00:00"
+
+
+@pytest.mark.parametrize("action", ["buy", "sell"])
+@pytest.mark.parametrize("value", ["1e308", "1e300", "1e10"])
+def test_huge_amounts_get_a_clear_error_not_a_500(action, value):
+    db = _fresh_db()
+    mid, (yes, _) = _market(db)
+    c = appmod.app.test_client()
+    for logged_in in (False, True):
+        if logged_in:
+            signup(c, "whale")
+        r = c.get(f"/api/quote?market={mid}&outcome={yes}&value={value}&action={action}")
+        assert r.status_code == 200 and r.get_json()["ok"] is False and "up to" in r.get_json()["error"]
+    with pytest.raises(appmod.TradeError):
+        appmod.execute_trade(db, 1, mid, yes, action, float(value))

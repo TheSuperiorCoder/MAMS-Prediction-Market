@@ -196,6 +196,15 @@ CREATE TABLE IF NOT EXISTS comment_mutes (
     created_at TEXT NOT NULL
 );
 
+-- One-time promotional bonuses already paid (e.g. promo = 'black_friday_2026'), so nobody gets one twice.
+CREATE TABLE IF NOT EXISTS promo_awards (
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    promo      TEXT NOT NULL,
+    amount     REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, promo)
+);
+
 -- Small site-wide settings, e.g. the announcement banner.
 CREATE TABLE IF NOT EXISTS site_settings (
     key        TEXT PRIMARY KEY,

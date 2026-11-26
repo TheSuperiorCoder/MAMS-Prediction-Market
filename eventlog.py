@@ -56,6 +56,7 @@ EVENTS = {
     "server_error": ("alert", "Server error"),
     "slow_request": ("warn", "Slow request"),
     "log_failed": ("alert", "Writing to the event log failed"),
+    "promo_awarded": ("info", "Promotional bonus paid"),
     # stock over/unders that couldn't settle themselves
     "stock_check_failed": ("warn", "Stock market couldn't be checked"),
     "stock_push": ("warn", "Stock market closed exactly on its line"),
