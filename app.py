@@ -163,6 +163,9 @@ PROPOSE_LIMIT = (10, 3600)              # market proposals per user per hour
 # heavy read-only pages (leaderboard, all loans, credit pages): per account when logged in, per IP otherwise. The
 # per-IP figure is higher because a whole school can share one address.
 HEAVY_PAGE_LIMITS = {"user": (60, 60), "ip": (240, 60)}
+# Every request, whatever the endpoint, on top of the stricter limits above: per account when logged in, per IP when
+# not, and a looser per-IP bucket for static files (a page load fetches several). (limit, window seconds)
+GLOBAL_LIMITS = {"user": (300, 60), "ip": (1200, 60), "static": (3000, 60)}
 
 
 def rate_limited(key, limit, window_seconds):
@@ -261,6 +264,25 @@ def flush_events(db):
 def start_request():
     g.request_id = secrets.token_hex(4)
     g.started = time.time()
+
+
+@app.before_request
+def global_rate_limit():
+    """Refuse floods on any endpoint before doing any work (it runs ahead of the database hooks). The account comes
+    from the signed session cookie, so this needs no database lookup."""
+    if request.endpoint in PWA_ENDPOINTS:
+        key, (limit, window) = ("all-static", request.remote_addr), GLOBAL_LIMITS["static"]
+    elif session.get("uid"):
+        key, (limit, window) = ("all-user", session["uid"]), GLOBAL_LIMITS["user"]
+    else:
+        key, (limit, window) = ("all-ip", request.remote_addr), GLOBAL_LIMITS["ip"]
+    if rate_limited(key, limit, window):
+        if not rate_limited(("flood-logged",) + key, 1, window):  # one event per flood per minute, not per request
+            log_event("page_throttled", detail=f"site-wide limit: {request.method} {request.path}")
+        if request.path.startswith("/api/"):
+            return jsonify(ok=False, error="Too many requests. Wait a minute and try again."), 429, \
+                {"Retry-After": str(window)}
+        return "Too many requests. Wait a minute and try again.", 429, {"Retry-After": str(window)}
 
 
 SLOW_REQUEST = 3.0  # seconds

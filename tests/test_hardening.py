@@ -135,3 +135,27 @@ def test_huge_amounts_get_a_clear_error_not_a_500(action, value):
         assert r.status_code == 200 and r.get_json()["ok"] is False and "up to" in r.get_json()["error"]
     with pytest.raises(appmod.TradeError):
         appmod.execute_trade(db, 1, mid, yes, action, float(value))
+
+
+def test_every_endpoint_is_rate_limited(monkeypatch):
+    monkeypatch.setattr(appmod, "GLOBAL_LIMITS", {"user": (5, 60), "ip": (8, 60), "static": (3, 60)})
+    db = _fresh_db()
+    mid, (yes, _) = _market(db)
+    visitor = appmod.app.test_client()
+    paths = ["/", "/how-it-works", f"/market/{mid}", f"/api/quote?market={mid}&outcome={yes}&value=5&action=buy"]
+    codes = [visitor.get(paths[i % len(paths)]).status_code for i in range(10)]
+    assert codes[:8] == [200] * 8 and codes[8:] == [429, 429]
+    r = visitor.get(paths[3])
+    assert r.status_code == 429 and r.get_json()["ok"] is False and r.headers["Retry-After"] == "60"
+    assert db.execute("SELECT COUNT(*) FROM security_events WHERE detail LIKE 'site-wide limit%'").fetchone()[0] == 1
+
+    # static files have their own bucket, so a throttled page doesn't stop the stylesheet loading (and vice versa)
+    assert [visitor.get("/static/style.css").status_code for _ in range(4)] == [200, 200, 200, 429]
+
+    # logged-in players are counted per account, not per (shared school) IP
+    player = appmod.app.test_client()
+    signup(player, "player")
+    assert [player.get("/").status_code for _ in range(6)] == [200] * 5 + [429]
+    other = appmod.app.test_client()
+    signup(other, "other")
+    assert other.get("/").status_code == 200
